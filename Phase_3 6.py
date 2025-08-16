@@ -1,6 +1,6 @@
 # app.py
 # ============================================================
-# 🏆 MLB Home Run Predictor — "Max Power" Edition (Weights pinned; no Tuner, no plots)
+# 🏆 MLB Home Run Predictor — "Max Power" Edition (Tuned, No-Tuner UI)
 # - Robust feature pruning & pinning
 # - Target encoding with time-embargoed OOF
 # - Tree ensemble (XGB/LGB/CB) + meta stacker (LR)
@@ -10,9 +10,8 @@
 # - NEW: Uncertainty-aware overlay shrinkage (always on)
 # - NEW: Reciprocal Rank Fusion auxiliary rank (always on)
 # - NEW: Model-disagreement penalty (always on)
-# - NEW: Incorporates recent TB/RBI signals (robust to missing)
-# - Daily logging + learning ranker apply (optional)
-# - Safe even if no hr_outcome or no learning_ranker yet
+# - Tuned blend weights baked in (NO Blend Tuner; no plots)
+# - Adds proxy outputs: prob_2tb (2+ Total Bases) and prob_rbi
 # ============================================================
 
 import streamlit as st
@@ -35,8 +34,7 @@ import catboost as cb
 
 from scipy.special import logit, expit
 
-# ===== PASTE YOUR TUNED WEIGHTS HERE (fallbacks shown) =====
-# Replace the values below with your tuned in-app weights.
+# ===== Tuned blend weights (locked) =====
 DEFAULT_WEIGHTS = dict(
     w_prob=0.3879,     # calibrated/base prob term
     w_overlay=0.0161,  # contextual overlay term
@@ -47,7 +45,7 @@ DEFAULT_WEIGHTS = dict(
 
 # ===================== UI =====================
 st.set_page_config(page_title="🏆 MLB Home Run Predictor — Max Power", layout="wide")
-st.title("🏆 MLB Home Run Predictor — Max Power (Pinned Weights, No Tuner)")
+st.title("🏆 MLB Home Run Predictor — Max Power")
 
 # ===================== Helpers / Utilities =====================
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -452,11 +450,6 @@ def _first_non_null(row, *cands, default=np.nan):
     return default
 
 def weak_pitcher_factor(row):
-    """
-    Composite multiplier for a weak/slumping pitcher.
-    Uses many optional fields if present; robust to missing.
-    Output is clipped to [0.90, 1.18].
-    """
     def _get(*names, default=np.nan):
         for n in names:
             if n in row and pd.notnull(row[n]):
@@ -527,22 +520,9 @@ def weak_pitcher_factor(row):
     return float(np.clip(factor, 0.90, 1.18))
 
 def short_term_hot_factor(row):
-    """
-    Incorporates recent EV/LA/Barrel plus TB/RBI signals (robust to missing).
-    Looks for *_3, *_5, *_7 windows if present.
-    """
     ev = _first_non_null(row, "b_avg_exit_velo_5", "b_avg_exit_velo_3", default=np.nan)
     la = _first_non_null(row, "b_la_mean_5", "b_la_mean_3", default=np.nan)
     br = _first_non_null(row, "b_barrel_rate_5", "b_barrel_rate_3", default=np.nan)
-
-    # NEW: TB/RBI signals (per-PA or per-game proxies)
-    tb_rate = _first_non_null(row,
-                              "b_tb_per_pa_5", "b_tb_per_pa_3", "b_tb_per_pa_7",
-                              "b_tb_per_game_5", "b_tb_per_game_3", default=np.nan)
-    rbi_rate = _first_non_null(row,
-                               "b_rbi_per_pa_5", "b_rbi_per_pa_3", "b_rbi_per_pa_7",
-                               "b_rbi_per_game_5", "b_rbi_per_game_3", default=np.nan)
-
     factor = 1.0
     try:
         if pd.notnull(ev) and float(ev) >= 91: factor *= 1.03
@@ -550,22 +530,9 @@ def short_term_hot_factor(row):
         if pd.notnull(br):
             if float(br) >= 0.12: factor *= 1.05
             elif float(br) >= 0.08: factor *= 1.02
-
-        # TB bump: modest—captures recent extra-base impact without overfitting
-        if pd.notnull(tb_rate):
-            v = float(tb_rate)
-            if v >= 0.55: factor *= 1.04
-            elif v >= 0.40: factor *= 1.02
-
-        # RBI bump: tiny (lineup/men-on dependent), keep conservative
-        if pd.notnull(rbi_rate):
-            v = float(rbi_rate)
-            if v >= 0.20: factor *= 1.02
-            elif v >= 0.12: factor *= 1.01
     except Exception:
         pass
-
-    return float(np.clip(factor, 0.96, 1.12))
+    return float(np.clip(factor, 0.96, 1.10))
 
 # ===================== APP START =====================
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
@@ -651,7 +618,7 @@ if event_file is not None and today_file is not None:
     X = winsorize_clip(X)
     X_today = winsorize_clip(X_today)
 
-    # --- Optional crosses (off by default)
+    # --- Optional crosses (off by default; retained but no plots) ---
     use_crosses = st.checkbox("Enable polynomial interaction crosses (slow, memory heavy)", value=False)
     if use_crosses:
         try:
@@ -676,7 +643,7 @@ if event_file is not None and today_file is not None:
         except Exception as e:
             st.error(f"❌ Cross-feature generation failed: {str(e)}")
 
-    # --- Cheap synergy & TB/RBI micro feats ---
+    # --- Cheap synergy feats ---
     def add_synergy_feats(df_ref, df_today_ref):
         for df in (df_ref, df_today_ref):
             if "b_fb_rate_7" in df.columns and "park_hr_rate" in df.columns:
@@ -702,16 +669,6 @@ if event_file is not None and today_file is not None:
             df["feat_pull_wind"] = 0.0  # train stays 0 to avoid leakage (filled for today below)
         if "p_fb_rate_14" in df.columns and "temp" in df.columns:
             df["feat_pfb_temp14"] = (df["p_fb_rate_14"].astype(np.float32) * np.maximum(0, df["temp"].astype(np.float32) - 70.0))
-
-        # NEW: Tiny TB/RBI micro features if present (robust defaults)
-        # Example expected columns: b_tb_per_pa_{3,5,7}, b_rbi_per_pa_{3,5,7}, or per_game variants.
-        tb = df.get("b_tb_per_pa_5", df.get("b_tb_per_pa_3", df.get("b_tb_per_pa_7", df.get("b_tb_per_game_5", 0.0))))
-        rbi = df.get("b_rbi_per_pa_5", df.get("b_rbi_per_pa_3", df.get("b_rbi_per_pa_7", df.get("b_rbi_per_game_5", 0.0))))
-        try:
-            df["feat_tb_rbi_combo"] = pd.to_numeric(tb, errors="coerce").fillna(0.0).astype(np.float32) * \
-                                      (pd.to_numeric(rbi, errors="coerce").fillna(0.0).astype(np.float32) + 0.05)
-        except Exception:
-            df["feat_tb_rbi_combo"] = 0.0
         return df
 
     X = add_micro_feats(X)
@@ -843,7 +800,6 @@ if event_file is not None and today_file is not None:
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
 
-        y_tr_s = smooth_labels(y_tr.values, smoothing=0.02)
         spw_fold = max(1.0, (len(y_tr)-y_tr.sum())/max(1.0, y_tr.sum()))
 
         preds_xgb_va, preds_lgb_va, preds_cat_va = [], [], []
@@ -869,7 +825,6 @@ if event_file is not None and today_file is not None:
                 verbose=0, thread_count=1, random_seed=sd
             )
 
-            # === Early stopping enabled (fast) ===
             xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
             lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
                         callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
@@ -917,7 +872,6 @@ if event_file is not None and today_file is not None:
             feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
             random_state=fold
         )
-        # Early stopping on the ranker too
         rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
         ranker_oof[va_idx] = rk.predict(X_va)
@@ -1046,30 +1000,76 @@ if event_file is not None and today_file is not None:
     # Bayesian shrink of p_base based on base-model disagreement
     model_std = disagree_std.astype(np.float32)
     s0, s1 = 0.02, 0.08
-    alpha_dis = np.clip((model_std - s0) / max(1e-9, (s1 - s0)), 0.0, 1.0) * 0.40
+    alpha_shrink = np.clip((model_std - s0) / max(1e-9, (s1 - s0)), 0.0, 1.0) * 0.40
     base_rate = float(np.clip(y.mean() if len(y) else 0.03, 1e-6, 1-1e-6))
-    p_base = (1.0 - alpha_dis) * np.clip(p_base, 1e-6, 1-1e-6) + alpha_dis * base_rate
+    p_base = (1.0 - alpha_shrink) * np.clip(p_base, 1e-6, 1-1e-6) + alpha_shrink * base_rate
     logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
 
-    # ---- FINAL BLEND (pinned weights; no tuner) ----
-    use_weights = DEFAULT_WEIGHTS.copy()
+    # --- Final blended score using tuned weights (NO tuner UI) ---
+    W = DEFAULT_WEIGHTS.copy()
+    ranked_score = expit(
+        W["w_prob"]    * logit_p
+      + W["w_overlay"] * log_overlay
+      + W["w_ranker"]  * zscore(ranker_z)
+      + W["w_rrf"]     * rrf_z
+      - W["w_penalty"] * dis_penalty
+    )
 
-    def _blend_score(w, a_logit, b_logoverlay, c_ranker, d_rrf, e_pen):
-        return expit(
-            w["w_prob"]    * a_logit
-          + w["w_overlay"] * b_logoverlay
-          + w["w_ranker"]  * c_ranker
-          + w["w_rrf"]     * d_rrf
-          - w["w_penalty"] * e_pen
-        )
+    # ================= Auxiliary props: 2+ Total Bases & RBI (proxies) =================
+    # Robust getters for best-available stat window
+    def pick_best_col(df, base, windows=(14, 30, 7, 20, 60, 5, 3)):
+        for w in windows:
+            c = f"{base}_{w}"
+            if c in df.columns:
+                return df[c].astype(float)
+        return pd.Series(np.nan, index=df.index, dtype="float32")
 
-    score = _blend_score(use_weights, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
+    b_slg = pick_best_col(today_df, "b_slg")
+    b_hh  = pick_best_col(today_df, "b_hard_hit_rate")
+    b_hc  = pick_best_col(today_df, "b_hard_contact_rate")  # sometimes present
+    b_fb  = pick_best_col(today_df, "b_fb_rate")
+    b_brl = pick_best_col(today_df, "b_barrel_rate")
+
+    # z-safe helper
+    def zsafe(s):
+        s = pd.to_numeric(s, errors="coerce").astype(float)
+        mu = np.nanmean(s.values); sd = np.nanstd(s.values) + 1e-9
+        return pd.Series((s.values - mu)/sd, index=s.index)
+
+    z_slg = zsafe(b_slg.fillna(b_slg.median()))
+    z_hh  = zsafe(b_hh.fillna(b_hh.median()))
+    z_hc  = zsafe(b_hc.fillna(b_hc.median()))
+    z_fb  = zsafe(b_fb.fillna(b_fb.median()))
+    z_brl = zsafe(b_brl.fillna(b_brl.median()))
+
+    # Proxy: probability of 2+ total bases (monotone with power & quality-of-contact)
+    # Uses HR prob backbone plus SLG/hard-hit/barrel and overlay tilt.
+    logits_2tb = (
+        1.40 * logit_p
+      + 0.70 * z_slg.values
+      + 0.45 * z_hh.values
+      + 0.35 * z_brl.values
+      + 0.20 * np.log(today_df["final_multiplier"].values + 1e-9)
+    )
+    prob_2tb = expit(logits_2tb)
+
+    # Proxy: RBI probability (power + contact + slight FB bias; lacking lineup context)
+    logits_rbi = (
+        1.20 * logit_p
+      + 0.50 * z_hc.values
+      + 0.35 * z_hh.values
+      + 0.20 * z_fb.values
+      + 0.15 * np.log(today_df["final_multiplier"].values + 1e-9)
+    )
+    prob_rbi = expit(logits_rbi)
 
     # ================= Leaderboard Build & Outputs =================
-    def build_leaderboard(df, calibrated_probs, final_score, label="calibrated_hr_probability"):
+    def build_leaderboard(df, calibrated_probs, final_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"):
         df = df.copy()
         df[label] = np.asarray(calibrated_probs)
         df["ranked_probability"] = np.asarray(final_score)
+        df["prob_2tb"] = np.asarray(prob_2tb)
+        df["prob_rbi"] = np.asarray(prob_rbi)
 
         df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
         df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
@@ -1080,6 +1080,7 @@ if event_file is not None and today_file is not None:
 
         cols += [
             label, "ranked_probability",
+            "prob_2tb", "prob_rbi",
             "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
             "final_multiplier_raw", "final_multiplier",
             "temp", "temp_rating", "humidity", "humidity_rating",
@@ -1088,21 +1089,16 @@ if event_file is not None and today_file is not None:
             # diagnostics
             "rrf_aux","model_disagreement",
             "hr_outcome",
-            # NEW: expose TB/RBI if present
-            "b_tb_per_pa_5","b_tb_per_pa_3","b_tb_per_game_5",
-            "b_rbi_per_pa_5","b_rbi_per_pa_3","b_rbi_per_game_5",
-            "feat_tb_rbi_combo",
         ]
         cols = [c for c in cols if c in df.columns]
         out = df[cols].copy()
 
-        if label in out.columns:
-            out[label] = out[label].round(4)
-        if "ranked_probability" in out.columns:
-            out["ranked_probability"] = out["ranked_probability"].round(4)
+        # rounding for readability
+        for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
         for c in ["overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-                  "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement",
-                  "feat_tb_rbi_combo"]:
+                  "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"]:
             if c in out.columns:
                 out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
         return out
@@ -1111,46 +1107,11 @@ if event_file is not None and today_file is not None:
     today_df["rrf_aux"] = rrf
     today_df["model_disagreement"] = disagree_std
 
-    leaderboard = build_leaderboard(today_df, p_base, score, label="hr_probability_iso_T")
+    leaderboard = build_leaderboard(today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T")
 
-    # ---- Optional: Hits@K bootstrap CI (table only; no plots)
-    with st.expander("📏 Hits@K — bootstrap confidence intervals"):
-        if "hr_outcome" in today_df.columns:
-            y_true_boot = today_df["hr_outcome"].fillna(0).astype(int).to_numpy()
-            if y_true_boot.sum() == 0 or y_true_boot.sum() == len(y_true_boot):
-                st.info("Need mixed labels (0/1) to compute Hits@K CIs.")
-            else:
-                def _hits_at_k(y, s, K):
-                    order = np.argsort(-s)
-                    return int(np.sum(y[order][:K]))
-
-                s_fixed = np.asarray(score, dtype=float)
-                n = len(s_fixed)
-                B = 300
-                Ks = [10, 20, 30]
-                boot = {k: [] for k in Ks}
-
-                rng = np.random.default_rng(123)
-                for _ in range(B):
-                    idx = rng.integers(0, n, size=n)
-                    y_b = y_true_boot[idx]
-                    s_b = s_fixed[idx]
-                    for K in Ks:
-                        boot[K].append(_hits_at_k(y_b, s_b, K))
-
-                ci_rows = []
-                for K in Ks:
-                    arr = np.array(boot[K], dtype=float)
-                    mean = arr.mean()
-                    lo, hi = np.percentile(arr, [5, 95])  # 90% CI
-                    ci_rows.append({"K": int(K), "Mean Hits": float(mean), "90% CI Low": float(lo), "90% CI High": float(hi)})
-                st.dataframe(pd.DataFrame(ci_rows), use_container_width=True)
-        else:
-            st.info("No hr_outcome in TODAY; bootstrap CIs require labels.")
-
-    # ===== Render current-day leaderboard (no plots) =====
+    # ===== Render current-day leaderboard (no charts) =====
     top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
-    st.markdown(f"### 🏆 **Top {top_n} HR Leaderboard (Blended + Overlays + Ranker)**")
+    st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
     leaderboard_top = leaderboard.head(int(top_n))
     st.dataframe(leaderboard_top, use_container_width=True)
 
@@ -1167,7 +1128,7 @@ if event_file is not None and today_file is not None:
         mime="text/csv",
     )
 
-    # Drift diagnostics (safe)
+    # Drift diagnostics (safe, no plots)
     try:
         drifted = drift_check(X, X_today, n=6)
         if drifted:
@@ -1178,4 +1139,4 @@ if event_file is not None and today_file is not None:
 
     gc.collect()
     st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-    st.caption("Meta-ensemble + calibrated probs + contextual overlays + TB/RBI micro-signal + RRF + disagreement control + (optional) learning ranker. Plots/Tuner removed.")
+    st.caption("Meta-ensemble + calibrated probs + contextual overlays + RRF + disagreement control + (optional) learning ranker. 2+TB and RBI proxies included.")
