@@ -6,3 +6,4 @@ xgboost
 lightgbm
 catboost
 joblib
+psutil
