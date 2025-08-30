@@ -212,7 +212,7 @@ def oof_target_encode(values, y, dates, folds, global_prior=None, smoothing=50.0
     return oof, final_map, float(global_prior)
 
 # ---------------- Embargoed time splits ----------------
-def embargo_time_splits(dates_series, n_splits=5, embargo_days=1):
+def embargo_time_splits(dates_series, n_splits=2, embargo_days=1):
     dates = pd.to_datetime(dates_series).reset_index(drop=True)
     u_days = pd.Series(dates.dt.floor("D")).dropna().unique()
     u_days = pd.to_datetime(u_days)
