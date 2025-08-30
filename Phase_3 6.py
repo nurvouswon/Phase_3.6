@@ -740,7 +740,7 @@ if event_file is not None and today_file is not None:
     if set(["pitcher_team_code","batter_hand"]).issubset(cats_full.columns):
         te_specs.append(("te_pteam_hand", _combo(cats_full["pitcher_team_code"], cats_full["batter_hand"])))
 
-    n_splits = 4
+    n_splits = 5
     folds = embargo_time_splits(dates_aligned, n_splits=n_splits, embargo_days=1)
 
     te_maps = {}
