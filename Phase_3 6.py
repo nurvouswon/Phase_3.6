@@ -674,39 +674,54 @@ if event_file is not None and today_file is not None:
     P_cat_oof = np.zeros(len(y), dtype=np.float32)
     P_xgb_today, P_lgb_today, P_cat_today = [], [], []
 
-    # === TT-Aug std vector aligned to X_today ===
-    # compute from train; reindex to today's columns; fill gaps with train median
-    feat_std_train = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)
-    feat_std_vec = feat_std_train.reindex(X_today.columns)
-    fill_val = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
-    feat_std_vec = np.maximum(1e-6, feat_std_vec.fillna(fill_val).to_numpy(dtype=np.float32))
+    # ==================== 🔒 Freeze feature schema + TT-Aug aligned ====================
 
-    def tt_aug_preds(clf, Xtd, B=3, noise_scale=0.003, kind="proba"):
-        """Stochastic test-time ensembling with column-aligned noise."""
-    # ensure numpy matrix in the SAME column order as feat_std_vec
-        if isinstance(Xtd, pd.DataFrame):
-            Xtd_mat = Xtd.to_numpy(dtype=np.float32)
-            n_features = Xtd_mat.shape[1]
+    # 1) Freeze the exact training column order
+    TRAIN_COLS = X.columns.tolist()
+
+    # 2) Build a prediction-aligned copy of today's matrix
+    X_today_pred = (
+        X_today.reindex(columns=TRAIN_COLS, fill_value=-1)
+               .astype(np.float32)
+    )
+
+    # Safety: identical feature count?
+    if X.shape[1] != X_today_pred.shape[1]:
+        st.error(f"Feature mismatch: train has {X.shape[1]} cols, today(aligned) has {X_today_pred.shape[1]} cols.")
+        st.stop()
+
+    # 3) TT-Aug std vector aligned to TRAIN_COLS
+    feat_std_train = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)   # std from train
+    feat_std_vec = feat_std_train.reindex(TRAIN_COLS)
+    _fill = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
+    feat_std_vec = np.maximum(1e-6, feat_std_vec.fillna(_fill).to_numpy(dtype=np.float32))  # shape (n_features,)
+
+    def tt_aug_preds(clf, Xtd_df, B=3, noise_scale=0.003, kind="proba"):
+        """
+        Stochastic test-time ensembling with per-feature noise aligned to TRAIN_COLS.
+        Pass DataFrame with TRAIN_COLS in order (we'll send X_today_pred).
+        """
+    # Ensure we operate on a matrix with exact TRAIN_COLS order
+        if isinstance(Xtd_df, pd.DataFrame):
+            if list(Xtd_df.columns) != TRAIN_COLS:
+                Xtd_df = Xtd_df.reindex(columns=TRAIN_COLS, fill_value=-1)
+            Xtd_mat = Xtd_df.to_numpy(dtype=np.float32)
         else:
-            Xtd_mat = np.asarray(Xtd, dtype=np.float32)
-            n_features = Xtd_mat.shape[1]
+    # If ndarray given, assume already aligned
+            Xtd_mat = np.asarray(Xtd_df, dtype=np.float32)
 
-    # safety: if columns changed, recompute std vector aligned to current Xtd
-        global feat_std_vec  # reuse if unchanged
-        if feat_std_vec.shape[0] != n_features:
-            _train_std = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)
-            if isinstance(Xtd, pd.DataFrame):
-                _vec = _train_std.reindex(Xtd.columns)
-            else:
-            # if we don't have columns (numpy), just fallback to overall median
-                _vec = _train_std
-            _fill = float(np.nanmedian(_train_std.values)) if np.isfinite(np.nanmedian(_train_std.values)) else 1e-3
-            feat_std_vec = np.maximum(1e-6, np.asarray(_vec.fillna(_fill), dtype=np.float32))
+    # Rebuild std vector if shapes drift (shouldn't happen, but safe)
+        if feat_std_vec.shape[0] != Xtd_mat.shape[1]:
+            _vec = feat_std_train.reindex(TRAIN_COLS)
+            _fill2 = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
+            vec = np.maximum(1e-6, _vec.fillna(_fill2).to_numpy(dtype=np.float32))
+        else:
+            vec = feat_std_vec
 
         preds = []
         for _ in range(B):
             noise = np.random.normal(0.0, noise_scale, size=Xtd_mat.shape).astype(np.float32)
-            noise *= feat_std_vec[np.newaxis, :]  # broadcast (1, n_features)
+            noise *= vec[np.newaxis, :]  # broadcast per-feature
             Xn = Xtd_mat + noise
             if kind == "ranker":
                 preds.append(clf.predict(Xn))
@@ -714,8 +729,14 @@ if event_file is not None and today_file is not None:
                 if hasattr(clf, "predict_proba"):
                     preds.append(clf.predict_proba(Xn)[:, 1])
                 else:
+                    from scipy.special import expit
                     preds.append(expit(clf.predict(Xn)).astype(np.float32))
         return np.mean(preds, axis=0)
+
+    # 4) Rebind to keep existing code unchanged: all downstream model calls that use `X_today`
+    #    will now receive the prediction-aligned matrix.
+    X_today = X_today_pred
+    # ================================================================================
 
     fold_times = []
     for fold, (tr_idx, va_idx) in enumerate(folds):
