@@ -1,6 +1,6 @@
 # app.py
 # ============================================================
-# 🏆 MLB Home Run Predictor — "Max Power" Edition (Upgraded + Faster)
+# 🏆 MLB Home Run Predictor — "Max Power" Edition (Upgraded)
 #
 # Always-on upgrades:
 # - Adaptive top-K temperature tuning
@@ -8,9 +8,9 @@
 # - Tie-breaking with 2TB/RBI
 # - Micro retune of w_prob / w_ranker on OOF (tiny grid)
 # - Park/hand Bayesian prior blend into p_base
-# - Handedness-segmented models + small TT-Aug (B=2)   <-- faster
+# - Handedness-segmented models + small TT-Aug (B=2)  <<— (reduced from 3)
 # - Polynomial crosses removed (no toggles)
-# - Perf tweaks: smaller preview table, fewer seeds, fewer trees/earlier stopping, cache overlays
+# - Streamlit Cloud speed fixes (smaller ensembles & caps)
 # ============================================================
 
 import streamlit as st
@@ -115,7 +115,9 @@ def winsorize_clip(X, limits=(0.01, 0.99)):
     return X
 
 def remove_outliers(X, y, method="iforest", contamination=0.012,
-                    n_estimators=150, max_samples='auto', n_neighbors=20, scale=True):
+                    n_estimators=100,        # was 150
+                    max_samples=20000,       # was 'auto'
+                    n_neighbors=20, scale=True):
     if scale:
         scaler = StandardScaler(); X_scaled = scaler.fit_transform(X)
     else: X_scaled = X
@@ -195,7 +197,6 @@ def embargo_time_splits(dates_series, n_splits=2, embargo_days=1):
 
 # ---------- Adaptive top-K temperature tuning ----------
 def choose_adaptive_K(n_rows):
-    # Smooth adaptive K that scales with slate size
     return int(np.clip(round(0.14 * n_rows), 12, 25))
 
 def tune_temperature_for_topk_adaptive(p_oof, y, K=None, T_grid=np.linspace(0.8, 1.6, 17)):
@@ -434,7 +435,7 @@ def short_term_hot_factor(row):
 
 # ===================== APP START =====================
 
-# Optional learning ranker upload (fail-closed if not perfect match)
+# Optional learning ranker upload (we'll fail closed if not perfect match)
 lr_file = st.file_uploader("Optional: upload learning_ranker.pkl", type=["pkl"], key="lrpk")
 
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
@@ -489,7 +490,8 @@ if event_file is not None and today_file is not None:
     if nzv_cols:
         X = X.drop(columns=nzv_cols); X_today = X_today.drop(columns=nzv_cols, errors='ignore')
 
-    corrs = X.corr().abs()
+    # (Speed) compute correlations on up to 40k sampled rows
+    corrs = X.sample(n=min(len(X), 40000), random_state=42).corr().abs()
     upper = corrs.where(np.triu(np.ones(corrs.shape), k=1).astype(bool))
     to_drop = [column for column in upper.columns if any(upper[column] > 0.999)]
     if to_drop:
@@ -562,20 +564,16 @@ if event_file is not None and today_file is not None:
         s = series.fillna("__NA__").astype(str)
         return s.map(lambda v: fmap.get(v, gmean)).astype(np.float32)
 
-    # Batch-append TE cols to avoid fragmentation warnings
-    add_today = {}
     if "park" in today_df.columns:
-        add_today["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
+        X_today["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
     if "team_code" in today_df.columns:
-        add_today["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
+        X_today["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
     if set(["park","batter_hand"]).issubset(today_df.columns):
-        add_today["te_park_hand"] = _map_series_to_te(_combo(today_df["park"], today_df["batter_hand"]),
-                                                      te_maps.get("te_park_hand", {}), global_means.get("te_park_hand", y.mean()))
+        X_today["te_park_hand"] = _map_series_to_te(_combo(today_df["park"], today_df["batter_hand"]),
+                                                    te_maps.get("te_park_hand", {}), global_means.get("te_park_hand", y.mean()))
     if set(["pitcher_team_code","batter_hand"]).issubset(today_df.columns):
-        add_today["te_pteam_hand"] = _map_series_to_te(_combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
-                                                       te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
-    if add_today:
-        X_today = pd.concat([X_today, pd.DataFrame(add_today)], axis=1)
+        X_today["te_pteam_hand"] = _map_series_to_te(_combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
+                                                     te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
 
     # ---------- Build overlay features for TRAIN (for OOF weight retune) ----------
     event_aligned = event_df.copy()
@@ -583,7 +581,8 @@ if event_file is not None and today_file is not None:
     event_aligned = event_aligned.loc[X.index].reset_index(drop=True)
     event_aligned = event_aligned.fillna({c: np.nan for c in event_aligned.columns})
 
-    def compute_overlay_cols(df):
+    @st.cache_data(show_spinner=False)
+    def compute_overlay_cols_cached(df):
         df = df.copy()
         ratings_df = df.apply(rate_weather, axis=1)
         for col in ratings_df.columns: df[col] = ratings_df[col]
@@ -595,7 +594,6 @@ if event_file is not None and today_file is not None:
             * df["weak_pitcher_factor"].astype(float)
             * df["hot_streak_factor"].astype(float)
         ).clip(0.60, 1.65).astype(np.float32)
-        # Uncertainty-aware shrink (use roof/temp/hum/wind if exist)
         roof = df.get("roof_status", pd.Series("", index=df.index)).astype(str).str.lower()
         roof_closed = roof.str.contains("closed|indoor|domed", regex=True)
         has_temp = df["temp"].notna() if "temp" in df.columns else pd.Series(False, index=df.index)
@@ -608,19 +606,10 @@ if event_file is not None and today_file is not None:
         df["final_multiplier"] = (1.0 + alpha * (df["final_multiplier_raw"].values - 1.0)).astype(np.float32)
         return df
 
-    @st.cache_data(show_spinner=False)
-    def compute_overlay_cols_cached(df):
-        return compute_overlay_cols(df)
-
     event_aligned = compute_overlay_cols_cached(event_aligned)
 
-    # Show a small preview only (UI perf)
-    st.dataframe(X_today.head(50))  # was 300
-
-    # ========== Train/Validation via Embargoed Time Splits ==========
-    # Lighter bagging for speed (keeps concept)
-    seeds = [42, 101]
-
+    # ---------- Train/Validation via Embargoed Time Splits ----------
+    seeds = [42, 101]  # was [42, 101, 202, 404] — faster, still robust
     P_xgb_oof = np.zeros(len(y), dtype=np.float32)
     P_lgb_oof = np.zeros(len(y), dtype=np.float32)
     P_cat_oof = np.zeros(len(y), dtype=np.float32)
@@ -629,7 +618,7 @@ if event_file is not None and today_file is not None:
     # For TT-Aug (std vector)
     feat_std = np.maximum(1e-6, X.std(axis=0).values)
 
-    def tt_aug_preds(clf, Xtd, B=2, noise_scale=0.003, kind="proba"):
+    def tt_aug_preds(clf, Xtd, B=2, noise_scale=0.003, kind="proba"):  # B=2 (was 3)
         preds = []
         for b in range(B):
             noise = np.random.normal(0.0, noise_scale, size=Xtd.shape).astype(np.float32) * feat_std
@@ -653,34 +642,37 @@ if event_file is not None and today_file is not None:
 
         for sd in seeds:
             xgb_clf = xgb.XGBClassifier(
-                n_estimators=500, max_depth=6, learning_rate=0.03,
+                n_estimators=450,       # was 650
+                max_depth=6, learning_rate=0.03,
                 subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
                 eval_metric="logloss", tree_method="hist",
-                scale_pos_weight=spw_fold, early_stopping_rounds=40,
+                scale_pos_weight=spw_fold, early_stopping_rounds=50,
                 n_jobs=1, verbosity=0, random_state=sd
             )
             lgb_clf = lgb.LGBMClassifier(
-                n_estimators=900, learning_rate=0.03, max_depth=-1, num_leaves=63,
-                feature_fraction=0.80, bagging_fraction=0.80, bagging_freq=1,
+                n_estimators=900,       # was 1200
+                learning_rate=0.03, max_depth=-1, num_leaves=63,
+                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                 reg_lambda=2.0, n_jobs=1, is_unbalance=True, random_state=sd
             )
             cat_clf = cb.CatBoostClassifier(
-                iterations=1100, depth=7, learning_rate=0.03, l2_leaf_reg=6.0,
+                iterations=900,         # was 1500
+                depth=7, learning_rate=0.03, l2_leaf_reg=6.0,
                 loss_function="Logloss", eval_metric="Logloss",
-                class_weights=[1.0, spw_fold], od_type="Iter", od_wait=40,
+                class_weights=[1.0, spw_fold], od_type="Iter", od_wait=50,
                 verbose=0, thread_count=1, random_seed=sd
             )
 
             xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
             lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
-                        callbacks=[lgb.early_stopping(40), lgb.log_evaluation(0)])
+                        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
             cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
             preds_xgb_va.append(xgb_clf.predict_proba(X_va)[:,1])
             preds_lgb_va.append(lgb_clf.predict_proba(X_va)[:,1])
             preds_cat_va.append(cat_clf.predict_proba(X_va)[:,1])
 
-            # TT-Aug for today predictions (B=2 for speed)
+            # TT-Aug for today predictions (B=2)
             preds_xgb_td.append(tt_aug_preds(xgb_clf, X_today, B=2, noise_scale=0.003))
             preds_lgb_td.append(tt_aug_preds(lgb_clf, X_today, B=2, noise_scale=0.003))
             preds_cat_td.append(tt_aug_preds(cat_clf, X_today, B=2, noise_scale=0.003))
@@ -697,8 +689,7 @@ if event_file is not None and today_file is not None:
         fold_times.append(fold_time)
         avg_time = np.mean(fold_times)
         est_time_left = avg_time * (len(folds) - (fold + 1))
-        st.write(f"Fold {fold + 1}/{len(folds)} finished in {timedelta(seconds=int(fold_time))}. "
-                 f"Est. {timedelta(seconds=int(est_time_left))} left.")
+        st.write(f"Fold {fold + 1}/{len(folds)} finished in {timedelta(seconds=int(fold_time))}. Est. {timedelta(seconds=int(est_time_left))} left.")
 
     # ---------- Day-wise LGBMRanker head ----------
     days = pd.to_datetime(dates_aligned).dt.floor("D")
@@ -716,12 +707,12 @@ if event_file is not None and today_file is not None:
 
         rk = lgb.LGBMRanker(
             objective="lambdarank", metric="ndcg",
-            n_estimators=500, learning_rate=0.05, num_leaves=63,
-            feature_fraction=0.80, bagging_fraction=0.80, bagging_freq=1,
+            n_estimators=600, learning_rate=0.05, num_leaves=63,
+            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
             random_state=fold
         )
         rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
-               callbacks=[lgb.early_stopping(40), lgb.log_evaluation(0)])
+               callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
         ranker_oof[va_idx] = rk.predict(X_va)
         # TT-Aug on ranker for today (B=2)
         ranker_today_parts.append(tt_aug_preds(rk, X_today, B=2, noise_scale=0.003, kind="ranker"))
@@ -778,12 +769,15 @@ if event_file is not None and today_file is not None:
         seg_L = hand == "L"
         return seg_L.values, seg_R.values
 
-    # Build an aligned copy for segmentation
-    event_aligned_hand = event_df.copy()
-    if order_idx is not None: event_aligned_hand = event_aligned_hand.loc[order_idx].reset_index(drop=True)
-    event_aligned_hand = event_aligned_hand.loc[X.index].reset_index(drop=True)
+    # Align a copy of event rows with X after outlier filtering
+    event_aligned = event_df.copy()
+    if 'game_date' in event_aligned.columns and order_idx is not None:
+        event_aligned = event_aligned.loc[order_idx].reset_index(drop=True)
+    event_aligned = event_aligned.loc[X.index].reset_index(drop=True)
+    event_aligned = event_aligned.fillna({c: np.nan for c in event_aligned.columns})
+    event_aligned = compute_overlay_cols_cached(event_aligned)
 
-    segL_idx, segR_idx = segment_indices(event_aligned_hand)
+    segL_idx, segR_idx = segment_indices(event_aligned)
     segL_today, segR_today = segment_indices(today_df)
 
     def train_segmented_preds(mask_tr, mask_td):
@@ -803,12 +797,12 @@ if event_file is not None and today_file is not None:
             y_tr, y_va = y_loc.iloc[loc_tr], y_loc.iloc[loc_va]
             spw_fold = max(1.0, (len(y_tr)-y_tr.sum())/max(1.0, y_tr.sum()))
             lgb_clf = lgb.LGBMClassifier(
-                n_estimators=600, learning_rate=0.03, num_leaves=63,
-                feature_fraction=0.80, bagging_fraction=0.80, bagging_freq=1,
+                n_estimators=700, learning_rate=0.03, num_leaves=63,
+                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                 reg_lambda=2.0, n_jobs=1, is_unbalance=True, random_state=77
             )
             lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
-                        callbacks=[lgb.early_stopping(40), lgb.log_evaluation(0)])
+                        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
             P_oof[loc_va] = lgb_clf.predict_proba(X_va)[:,1]
             X_td_sub = X_today[mask_td]
             if len(X_td_sub):
@@ -826,10 +820,10 @@ if event_file is not None and today_file is not None:
     if P_segR_td is not None:
         P_today_meta_seg[segR_today] = 0.5*P_today_meta_seg[segR_today] + 0.5*np.asarray(P_segR_td)
 
-    # Replace calibrated base with segmented-augmented calibrated+prior
+    # Calibrated base with segmented augmentation + prior
     p_base = (1.0 - beta_prior) * expit(logit(np.clip(P_today_meta_seg, 1e-6, 1-1e-6)) * best_T) + beta_prior * prior_today
 
-    # ---------- Build TODAY overlay columns (cached) ----------
+    # ---------- TODAY overlay columns (for proxies, tie-breaks, RRF, etc.) ----------
     today_df = compute_overlay_cols_cached(today_df)
 
     # ---------- OOF helpers for micro weight retune ----------
@@ -860,7 +854,7 @@ if event_file is not None and today_file is not None:
     disagree_std = np.std(np.vstack([p_xgb, p_lgb, p_cat]), axis=0)
     dis_penalty = np.clip(zscore(disagree_std), 0, 3)
 
-    # ---------- 2TB / RBI proxies (for tie-break & learner features) ----------
+    # ---------- 2TB / RBI proxies ----------
     def pick_best_col(df, base, windows=(14, 30, 7, 20, 60, 5, 3)):
         for w in windows:
             c = f"{base}_{w}"
@@ -898,7 +892,7 @@ if event_file is not None and today_file is not None:
                   + 0.15 * np.log(today_df["final_multiplier"].values + 1e-9))
     prob_rbi = expit(logits_rbi)
 
-    # ---------- Micro retune of w_prob / w_ranker on OOF (tiny grid, no leakage) ----------
+    # ---------- Micro retune of w_prob / w_ranker on OOF (tiny grid) ----------
     base_W = DEFAULT_WEIGHTS.copy()
     grid = [0.85, 1.0, 1.15]
     best_loss, best_W = 1e9, base_W.copy()
@@ -921,23 +915,23 @@ if event_file is not None and today_file is not None:
 
     # ---------- Learning ranker (fail-closed parity check) ----------
     feat_map_today = {
-        "base_prob":           np.asarray(p_base, dtype=float),
-        "logit_p":             logit_p,
-        "log_overlay":         np.log(today_df["final_multiplier"].values + 1e-9),
-        "ranker_z":            zscore(ranker_today),
-        "overlay_multiplier":  today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
-        "final_multiplier":    today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
-        "final_multiplier_raw":today_df.get("final_multiplier_raw",pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
-        "rrf_aux":             rrf,
-        "model_disagreement":  disagree_std,
-        "prob_2tb":            prob_2tb,
-        "prob_rbi":            prob_rbi,
-        "temp":                today_df.get("temp", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
-        "humidity":            today_df.get("humidity", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
-        "wind_mph":            today_df.get("wind_mph", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
+        "base_prob":            np.asarray(p_base, dtype=float),
+        "logit_p":              logit_p,
+        "log_overlay":          np.log(today_df["final_multiplier"].values + 1e-9),
+        "ranker_z":             zscore(ranker_today),
+        "overlay_multiplier":   today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+        "final_multiplier":     today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+        "final_multiplier_raw": today_df.get("final_multiplier_raw", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+        "rrf_aux":              rrf,
+        "model_disagreement":   disagree_std,
+        "prob_2tb":             prob_2tb,
+        "prob_rbi":             prob_rbi,
+        "temp":                 today_df.get("temp", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
+        "humidity":             today_df.get("humidity", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
+        "wind_mph":             today_df.get("wind_mph", pd.Series(np.nan, index=today_df.index)).to_numpy(dtype=float),
     }
 
-    ranker_z = zscore(ranker_today)  # default baseline
+    ranker_z = zscore(ranker_today)  # default
 
     if lr_file is not None:
         try:
@@ -975,7 +969,7 @@ if event_file is not None and today_file is not None:
         except Exception as e:
             st.warning(f"Could not load/apply learning ranker (fail-closed): {e}")
 
-    # ---------- Final blended score using *retuned* weights ----------
+    # ---------- Final blended score using retuned weights ----------
     log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
     W = best_W
     ranked_score = expit(
