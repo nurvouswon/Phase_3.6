@@ -740,7 +740,7 @@ if event_file is not None and today_file is not None:
     if set(["pitcher_team_code","batter_hand"]).issubset(cats_full.columns):
         te_specs.append(("te_pteam_hand", _combo(cats_full["pitcher_team_code"], cats_full["batter_hand"])))
 
-    n_splits = 5
+    n_splits = 2
     folds = embargo_time_splits(dates_aligned, n_splits=n_splits, embargo_days=1)
 
     te_maps = {}
@@ -951,35 +951,68 @@ if event_file is not None and today_file is not None:
     if lr_file is not None:
         try:
             bundle = pickle.load(lr_file)
-            # Prefer single model under key "model"; else fallback to bundle["models"]["lgb"] or any available
+
+        # Prefer a single model under "model"; else try bundle["models"] entries
             lbr = bundle.get("model")
             if lbr is None and "models" in bundle:
                 models = bundle["models"]
                 lbr = models.get("lgb") or next((m for m in models.values() if m is not None), None)
-            rk_feats = bundle.get("features", ["base_prob","logit_p","log_overlay","ranker_z","overlay_multiplier","final_multiplier"])
 
-            if lbr is not None:
-                feat_map = {
-                    "base_prob":   np.asarray(today_iso_t, dtype=float),
-                    "logit_p":     logit(np.clip(today_iso_t, 1e-6, 1 - 1e-6)),
-                    "log_overlay": np.log(today_df["final_multiplier"].values + 1e-9),
-                    "ranker_z":    zscore(ranker_today),
-                    "overlay_multiplier": today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
-                    "final_multiplier":   today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
-                }
-                Xrk_today = np.column_stack([feat_map[f] for f in rk_feats if f in feat_map]).astype(np.float32)
-                learned_rank_score = lbr.predict(Xrk_today)
-                st.info("Applied learning ranker. Replacing original ranker_z for blending.")
-                ranker_z = zscore(learned_rank_score)
-            else:
+        # Expected features from the training bundle (exact order matters)
+            expected_feats = [str(f) for f in bundle.get("features", [])]
+
+        # Build all candidate features available at prediction time
+            feat_map = {
+                "base_prob":   np.asarray(today_iso_t, dtype=float),
+                "logit_p":     logit(np.clip(today_iso_t, 1e-6, 1 - 1e-6)),
+                "log_overlay": np.log(today_df["final_multiplier"].values + 1e-9),
+                "ranker_z":    zscore(ranker_today),
+                "overlay_multiplier": today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+                "final_multiplier":   today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+            }
+
+        # Diagnostics: which expected features are present/missing?
+            available_feats = [f for f in expected_feats if f in feat_map]
+            missing_feats   = [f for f in expected_feats if f not in feat_map]
+            extra_buildable = [f for f in feat_map.keys() if f not in expected_feats]
+
+            st.markdown("#### 🔎 Learning Ranker Feature Check")
+            st.write({
+                "expected_count": len(expected_feats),
+                "built_count": len(available_feats),
+                "expected_features": expected_feats,
+                "built_features": available_feats,
+                "missing_features": missing_feats,
+                "extra_buildable_not_used": extra_buildable
+            })
+
+            if lbr is None:
                 st.warning("learning_ranker.pkl did not contain a usable model; falling back to LGB ranker head.")
                 ranker_z = zscore(ranker_today)
+            elif len(available_feats) != len(expected_feats):
+                st.warning(
+                    f"Could not apply learning ranker: expected {len(expected_feats)} features but "
+                    f"only built {len(available_feats)} today. Falling back."
+                )
+                ranker_z = zscore(ranker_today)
+            else:
+            # Build matrix in the exact order the model was trained with
+                Xrk_today = np.column_stack([feat_map[f] for f in expected_feats]).astype(np.float32)
+
+            # Extra safety: shape check against model if it exposes n_features_in_
+                nfi = getattr(lbr, "n_features_in_", Xrk_today.shape[1])
+                if nfi != Xrk_today.shape[1]:
+                    st.warning(f"Model expects {nfi} features; built {Xrk_today.shape[1]}. Falling back.")
+                    ranker_z = zscore(ranker_today)
+                else:
+                    learned_rank_score = lbr.predict(Xrk_today)
+                    ranker_z = zscore(learned_rank_score)
+                    st.success("✅ Applied learning ranker successfully.")
         except Exception as e:
             st.warning(f"Could not load/apply learning ranker: {e}")
             ranker_z = zscore(ranker_today)
     else:
         ranker_z = zscore(ranker_today)
-
     # ---- Base prob terms (use temp-tuned isotonic if available)
     try:
         p_base = today_iso_t
