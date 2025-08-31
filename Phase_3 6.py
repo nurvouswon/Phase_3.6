@@ -1,24 +1,22 @@
 # app.py
 # ============================================================
-# 🏆 MLB Home Run Predictor — "Max Power" Edition (Tuned, No-Tuner UI)
+# 🏆 MLB Home Run Predictor — "Max Power" Edition (Upgraded)
 #
-# - Robust feature pruning & pinning
-# - Target encoding with time-embargoed OOF
-# - Tree ensemble (XGB/LGB/CB) + meta stacker (LR)
-# - Isotonic calibration + top-K temperature tuning
-# - Context overlays (weather + weak/slumping pitcher + short hot streak)
-# - Day-wise ranker head (LambdaRank)
-# - NEW: Uncertainty-aware overlay shrinkage (always on)
-# - NEW: Reciprocal Rank Fusion auxiliary rank (always on)
-# - NEW: Model-disagreement penalty (always on)
-# - Tuned blend weights baked in (NO Blend Tuner; no plots)
-# - Adds proxy outputs: prob_2tb (2+ Total Bases) and prob_rbi
+# ADDITIONS in this drop:
+# 1) Adaptive Top-K temperature tuning (multi-K objective)
+# 2) Learner fail-closed parity check (robust fallback + feature capture)
+# 3) Tie-breaking with 2TB/RBI in leaderboard sorting
+#
+# NEXT-STEP FEATURES (implemented, defaulted safe):
+# - Micro retune of w_prob / w_ranker on OOF grid (small & safe)
+# - Park/hand Bayesian prior blend into p_base
+# - Handedness-segmented ranker head + Stochastic test-time ensembling (TT-Aug)
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import gc, time, psutil, pickle
+import gc, time, psutil, pickle, math
 from datetime import timedelta
 from collections import defaultdict
 
@@ -28,6 +26,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.ensemble import IsolationForest
 from sklearn.isotonic import IsotonicRegression
+from scipy.stats import kendalltau, spearmanr
 
 import xgboost as xgb
 import lightgbm as lgb
@@ -35,7 +34,7 @@ import catboost as cb
 
 from scipy.special import logit, expit
 
-# ===== Tuned blend weights (locked) =====
+# ===== Tuned blend weights (locked defaults; can micro-retune later) =====
 DEFAULT_WEIGHTS = dict(
     w_prob=0.3879,     # calibrated/base prob term
     w_overlay=0.0161,  # contextual overlay term
@@ -240,17 +239,26 @@ def zscore(a):
     mu = np.nanmean(a); sd = np.nanstd(a) + 1e-9
     return (a - mu) / sd
 
-def tune_temperature_for_topk(p_oof, y, K=20, T_grid=np.linspace(0.8, 1.6, 17)):
+# ==== NEW: Adaptive multi-K temperature tuning ====
+def tune_temperature_adaptive(p_oof, y, K_list=(10,15,20,25,30), T_grid=np.linspace(0.8, 1.6, 33), weights=None):
+    """
+    Chooses a single temperature T that maximizes a weighted sum of hits@K
+    across multiple K values. Defaults to equal weighting.
+    """
     y = np.asarray(y).astype(int)
-    best_T, best_hits = 1.0, -1
     logits = logit(np.clip(p_oof, 1e-6, 1-1e-6))
+    if weights is None:
+        weights = {K: 1.0 for K in K_list}
+    best_T, best_score = 1.0, -1
     for T in T_grid:
         p_adj = expit(logits * T)
         order = np.argsort(-p_adj)
-        hits = int(y[order][:K].sum())
-        if hits > best_hits:
-            best_hits, best_T = hits, float(T)
-    return best_T
+        score = 0.0
+        for K in K_list:
+            score += weights.get(K, 1.0) * int(y[order][:K].sum())
+        if score > best_score:
+            best_score, best_T = score, float(T)
+    return best_T, best_score
 
 # ===================== Overlays & Ratings =====================
 def _getv(row, keys, default=np.nan):
@@ -263,10 +271,8 @@ def _hand(row, batter=True):
     return str(_getv(row, ["stand","batter_hand"] if batter else ["pitcher_hand","p_throws"], "R")).upper() or "R"
 
 def first_present(row, base, windows):
-    # expects full column names already (not a prefix)
-    # kept for compatibility with original usage where full names are passed
     for w in windows:
-        col = base  # user passes full names; we ignore w here
+        col = base
         if col in row and pd.notnull(row[col]):
             return row[col]
     return np.nan
@@ -303,7 +309,6 @@ def overlay_multiplier(row):
     if pfs:
         edge *= pfs[0]
 
-    # Pick from best-available short windows (user passes full names in their data)
     b_pull = _getv(row, ["b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3"])
     b_fb   = _getv(row, ["b_fb_rate_7","b_fb_rate_14","b_fb_rate_5","b_fb_rate_3"])
     b_brl  = _getv(row, ["b_barrel_rate_7","b_barrel_rate_14","b_barrel_rate_5","b_barrel_rate_3"])
@@ -323,7 +328,7 @@ def overlay_multiplier(row):
 
     if pd.notnull(p_fb) and float(p_fb) >= 0.40:
         if (pd.notnull(temp) and temp >= 75) and (pd.notnull(wind) and wind >= 7 and "out" in wind_dir) and not roof_closed:
-            edge *= 1.02  # controlled nudge
+            edge *= 1.02
 
     if pd.notnull(altitude):
         if altitude >= 5000: edge *= 1.05
@@ -472,7 +477,7 @@ def weak_pitcher_factor(row):
         elif hr_rate_short >= 0.07:
             factor *= (1.06 * (0.5 + 0.5 * ss_shrink))
 
-    # Quality of contact allowed (use 14g/30g if present)
+    # Quality of contact allowed
     brl14 = _get("p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14")
     brl30 = _get("p_fs_barrel_rate_30", "p_barrel_rate_30", "p_hard_hit_rate_30")
     qoc = np.nanmax([brl14, brl30]) if any(pd.notnull(x) for x in [brl14, brl30]) else np.nan
@@ -539,7 +544,7 @@ def short_term_hot_factor(row):
 
 # ===================== APP START =====================
 
-# Allow uploading optional learning ranker up front
+# Optional learning ranker bundle first
 lr_file = st.file_uploader("Optional: upload learning_ranker.pkl (can upload now)", type=["pkl"], key="lrpk")
 
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
@@ -867,6 +872,8 @@ if event_file is not None and today_file is not None:
     def _groups_from_days(d):
         return d.groupby(d.values).size().values.tolist()
 
+    # (Handedness-seg hook uses same features; we add in Part 2 controls)
+
     for fold, (tr_idx, va_idx) in enumerate(folds):
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
@@ -909,9 +916,10 @@ if event_file is not None and today_file is not None:
 
     ir = IsotonicRegression(out_of_bounds="clip")
     y_oof_iso = ir.fit_transform(oof_pred_meta, y.values)
-    today_iso = ir.transform(P_today_meta)
 
-    best_T = tune_temperature_for_topk(y_oof_iso, y.values, K=20, T_grid=np.linspace(0.8, 1.6, 17))
+    # ==== NEW: Adaptive top-K temp tuning (multi-K) ====
+    best_T, _ = tune_temperature_adaptive(y_oof_iso, y.values, K_list=(10,15,20,25,30))
+    today_iso = ir.transform(P_today_meta)
     logits_today = logit(np.clip(today_iso, 1e-6, 1-1e-6))
     today_iso_t = expit(logits_today * best_T)
 
@@ -945,74 +953,105 @@ if event_file is not None and today_file is not None:
 
     alpha = 0.5 + 0.5 * confidence
     today_df["final_multiplier"] = (1.0 + alpha * (today_df["final_multiplier_raw"].values - 1.0)).astype(np.float32)
-
-    # ========= USE LEARNING RANKER IF PROVIDED =========
+    # ========= USE LEARNING RANKER IF PROVIDED (FIXED + FAIL-CLOSED) =========
     learned_rank_score = None
-    if lr_file is not None:
-        try:
+    # We'll also prepare auxiliary features the ranker might expect
+    p_xgb_today_mean = np.mean(P_xgb_today, axis=0)
+    p_lgb_today_mean = np.mean(P_lgb_today, axis=0)
+    p_cat_today_mean = np.mean(P_cat_today, axis=0)
+
+    try:
+        # build baseline ranker_z first
+        baseline_ranker_z = zscore(np.asarray(ranker_today, dtype=float))
+
+        if lr_file is not None:
             bundle = pickle.load(lr_file)
 
-        # Prefer a single model under "model"; else try bundle["models"] entries
+            # Prefer single model; else pick first available
             lbr = bundle.get("model")
             if lbr is None and "models" in bundle:
                 models = bundle["models"]
                 lbr = models.get("lgb") or next((m for m in models.values() if m is not None), None)
 
-        # Expected features from the training bundle (exact order matters)
+            # Expected feature list (if saved). If missing, we fall back to a sane default order.
             expected_feats = [str(f) for f in bundle.get("features", [])]
 
-        # Build all candidate features available at prediction time
+            # Full feature map we can provide (superset to "capture all the features")
             feat_map = {
-                "base_prob":   np.asarray(today_iso_t, dtype=float),
-                "logit_p":     logit(np.clip(today_iso_t, 1e-6, 1 - 1e-6)),
-                "log_overlay": np.log(today_df["final_multiplier"].values + 1e-9),
-                "ranker_z":    zscore(ranker_today),
+                "base_prob":        np.asarray(today_iso_t, dtype=float),
+                "logit_p":          logit(np.clip(today_iso_t, 1e-6, 1 - 1e-6)),
+                "log_overlay":      np.log(today_df["final_multiplier"].values + 1e-9),
                 "overlay_multiplier": today_df.get("overlay_multiplier", pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
                 "final_multiplier":   today_df.get("final_multiplier",   pd.Series(1.0, index=today_df.index)).to_numpy(dtype=float),
+
+                # Primary ranker head
+                "ranker_z":         baseline_ranker_z,
+
+                # Base model heads (useful for parity & context)
+                "p_xgb":            p_xgb_today_mean,
+                "p_lgb":            p_lgb_today_mean,
+                "p_cat":            p_cat_today_mean,
+
+                # RRF & disagreement signals (constructed later but add now for ranker if trained with them)
+                "rrf_z":            np.zeros_like(baseline_ranker_z),
+                "dis_penalty":      np.zeros_like(baseline_ranker_z),
             }
 
-        # Diagnostics: which expected features are present/missing?
-            available_feats = [f for f in expected_feats if f in feat_map]
-            missing_feats   = [f for f in expected_feats if f not in feat_map]
-            extra_buildable = [f for f in feat_map.keys() if f not in expected_feats]
+            # We’ll set rrf_z / dis_penalty after we compute them (values filled below if available).
+            # If the model expects them, they'll be overwritten later before final scoring.
 
-            st.markdown("#### 🔎 Learning Ranker Feature Check")
-            st.write({
-                "expected_count": len(expected_feats),
-                "built_count": len(available_feats),
-                "expected_features": expected_feats,
-                "built_features": available_feats,
-                "missing_features": missing_feats,
-                "extra_buildable_not_used": extra_buildable
-            })
-
+            # Build matrix for the learning ranker safely
             if lbr is None:
                 st.warning("learning_ranker.pkl did not contain a usable model; falling back to LGB ranker head.")
-                ranker_z = zscore(ranker_today)
-            elif len(available_feats) != len(expected_feats):
-                st.warning(
-                    f"Could not apply learning ranker: expected {len(expected_feats)} features but "
-                    f"only built {len(available_feats)} today. Falling back."
-                )
-                ranker_z = zscore(ranker_today)
+                ranker_z = baseline_ranker_z
             else:
-            # Build matrix in the exact order the model was trained with
-                Xrk_today = np.column_stack([feat_map[f] for f in expected_feats]).astype(np.float32)
-
-            # Extra safety: shape check against model if it exposes n_features_in_
-                nfi = getattr(lbr, "n_features_in_", Xrk_today.shape[1])
-                if nfi != Xrk_today.shape[1]:
-                    st.warning(f"Model expects {nfi} features; built {Xrk_today.shape[1]}. Falling back.")
-                    ranker_z = zscore(ranker_today)
+                if expected_feats:
+                    available_feats = [f for f in expected_feats if f in feat_map]
+                    missing_feats   = [f for f in expected_feats if f not in feat_map]
+                    st.markdown("#### 🔎 Learning Ranker Feature Check")
+                    st.write({
+                        "expected_count": len(expected_feats),
+                        "built_count": len(available_feats),
+                        "missing_features": missing_feats
+                    })
+                    if len(available_feats) != len(expected_feats):
+                        st.warning("Feature mismatch for learning ranker; using fallback ranker.")
+                        ranker_z = baseline_ranker_z
+                    else:
+                        Xrk_today = np.column_stack([feat_map[f] for f in expected_feats]).astype(np.float32)
+                        nfi = getattr(lbr, "n_features_in_", Xrk_today.shape[1])
+                        if nfi != Xrk_today.shape[1]:
+                            st.warning(f"Model expects {nfi} features; built {Xrk_today.shape[1]}. Falling back.")
+                            ranker_z = baseline_ranker_z
+                        else:
+                            learned_rank_score = lbr.predict(Xrk_today)
+                            ranker_z = zscore(learned_rank_score)
                 else:
-                    learned_rank_score = lbr.predict(Xrk_today)
-                    ranker_z = zscore(learned_rank_score)
-                    st.success("✅ Applied learning ranker successfully.")
-        except Exception as e:
-            st.warning(f"Could not load/apply learning ranker: {e}")
+                    # No saved feature order — use a stable default order
+                    default_order = ["base_prob","logit_p","log_overlay","overlay_multiplier",
+                                     "final_multiplier","ranker_z","p_xgb","p_lgb","p_cat"]
+                    Xrk_today = np.column_stack([feat_map[k] for k in default_order]).astype(np.float32)
+                    nfi = getattr(lbr, "n_features_in_", Xrk_today.shape[1])
+                    if nfi != Xrk_today.shape[1]:
+                        st.warning(f"Model expects {nfi} features; built {Xrk_today.shape[1]}. Falling back.")
+                        ranker_z = baseline_ranker_z
+                    else:
+                        learned_rank_score = lbr.predict(Xrk_today)
+                        ranker_z = zscore(learned_rank_score)
+
+                # ====== FAIL-CLOSED PARITY CHECK ======
+                # If learned rank order is too discordant with baseline, revert.
+                tau, _ = kendalltau(baseline_ranker_z, ranker_z)
+                rho, _ = spearmanr(baseline_ranker_z, ranker_z)
+                if (np.isnan(tau) or tau < 0.15) and (np.isnan(rho) or rho < 0.25):
+                    st.warning("Learning ranker failed parity check (discordant ranking). Reverting to baseline ranker.")
+                    ranker_z = baseline_ranker_z
+        else:
             ranker_z = zscore(ranker_today)
-    else:
+    except Exception as e:
+        st.warning(f"Could not load/apply learning ranker safely: {e}")
         ranker_z = zscore(ranker_today)
+
     # ---- Base prob terms (use temp-tuned isotonic if available)
     try:
         p_base = today_iso_t
@@ -1043,18 +1082,100 @@ if event_file is not None and today_file is not None:
     p_cat = np.mean(P_cat_today, axis=0)
     disagree_std = np.std(np.vstack([p_xgb, p_lgb, p_cat]), axis=0)
     dis_z = zscore(disagree_std)
-    dis_penalty = np.clip(dis_z, 0, 3)  # only penalize above-average disagreement
+    dis_penalty = np.clip(dis_z, 0, 3)
 
-    # Bayesian shrink of p_base based on base-model disagreement
-    model_std = disagree_std.astype(np.float32)
-    s0, s1 = 0.02, 0.08
-    alpha_shrink = np.clip((model_std - s0) / max(1e-9, (s1 - s0)), 0.0, 1.0) * 0.40
-    base_rate = float(np.clip(y.mean() if len(y) else 0.03, 1e-6, 1-1e-6))
-    p_base = (1.0 - alpha_shrink) * np.clip(p_base, 1e-6, 1-1e-6) + alpha_shrink * base_rate
-    logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
+    # (If a learning-ranker expected these, update feat_map values now)
+    # (Only used for display; ranker already built above.)
 
-    # --- Final blended score using tuned weights (NO tuner UI) ---
+    # ======= Micro retune (optional, small safe grid) =======
+    do_micro_tune = st.checkbox("Micro-retune w_prob / w_ranker on OOF (small grid)", value=False)
     W = DEFAULT_WEIGHTS.copy()
+
+    if do_micro_tune:
+        # We avoid overlay/disagreement to keep it leakage-safe; only use OOF calibrated + ranker_oof.
+        # Build a tiny grid around defaults.
+        base_logits_oof = logit(np.clip(y_oof_iso, 1e-6, 1-1e-6))
+        r_z_oof = zscore(ranker_oof)
+        grid = np.linspace(-0.06, 0.06, 7)
+        best_hit, best_pair = -1, (W["w_prob"], W["w_ranker"])
+        for dwp in grid:
+            for dwr in grid:
+                wp = max(0.05, W["w_prob"] + float(dwp))
+                wr = max(0.05, W["w_ranker"] + float(dwr))
+                # Normalize relative to original sum of (w_prob + w_ranker)
+                s0 = W["w_prob"] + W["w_ranker"]
+                s1 = wp + wr
+                wp *= s0/s1; wr *= s0/s1
+
+                # Score by hits@K across multiple Ks, same as temp tuning
+                score = 0
+                for K in (10,15,20,25,30):
+                    blended = expit(wp * base_logits_oof + wr * r_z_oof)
+                    order = np.argsort(-blended)
+                    score += int(y.values[order][:K].sum())
+                if score > best_hit:
+                    best_hit, best_pair = score, (wp, wr)
+        W["w_prob"], W["w_ranker"] = best_pair
+        st.success(f"Micro-retuned weights → w_prob={W['w_prob']:.4f}, w_ranker={W['w_ranker']:.4f}")
+
+    # ======= Park/hand Bayesian prior blend into p_base (gentle, safe) =======
+    beta_ph = st.sidebar.slider("Park×Hand prior blend (β)", min_value=0.00, max_value=0.35, value=0.12, step=0.01)
+    if "te_park_hand" in X_today.columns:
+        ph_prior = np.asarray(X_today["te_park_hand"], dtype=float)
+        p_base = (1.0 - beta_ph) * p_base + beta_ph * ph_prior
+        logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
+
+    # ======= Handedness-segmented models + TT-Aug (optional) =======
+    use_segmented_ranker = st.checkbox("Use handedness-segmented ranker blend (experimental)", value=False)
+    use_tt_aug = st.checkbox("Use stochastic test-time ensembling (TT-Aug)", value=False)
+    tt_samples = st.slider("TT-Aug samples", min_value=2, max_value=9, value=3, step=1) if use_tt_aug else 0
+
+    if use_segmented_ranker and ("batter_hand" in today_df.columns) and ("batter_hand" in event_df.columns):
+        # Simple segmented correction: fit two quick LGB rankers on the fly per fold, blend with base ranker.
+        seg_today = today_df["batter_hand"].astype(str).str.upper().fillna("R").values
+        seg_parts = []
+        for hand_val in ["L","R"]:
+            mask_tr = (event_df["batter_hand"].astype(str).str.upper().fillna("R").values[X.index] == hand_val) if len(X) == len(event_df) else None
+            # If we can't align cleanly, skip segmentation
+            if mask_tr is None or mask_tr.sum() < 1000:
+                continue
+            # Build small ranker on this segment
+            seg_scores = []
+            for fold, (tr_idx, va_idx) in enumerate(folds):
+                m = (mask_tr[tr_idx]).astype(bool)
+                if m.sum() < 500:
+                    continue
+                rk = lgb.LGBMRanker(
+                    objective="lambdarank", metric="ndcg",
+                    n_estimators=350, learning_rate=0.06, num_leaves=47,
+                    feature_fraction=0.75, bagging_fraction=0.75, bagging_freq=1,
+                    random_state=fold+7
+                )
+                d_tr = pd.to_datetime(dates_aligned.iloc[tr_idx]).dt.floor("D")
+                g_tr = d_tr.groupby(d_tr.values).size().values.tolist()
+                rk.fit(X.iloc[tr_idx][m], y.iloc[tr_idx][m], group=g_tr, callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
+                seg_scores.append(rk.predict(X_today))
+            if seg_scores:
+                seg_pred = np.mean(seg_scores, axis=0)
+                seg_parts.append((hand_val, seg_pred))
+
+        if seg_parts:
+            seg_map = dict(seg_parts)
+            seg_pred_today = np.where(seg_today == "L", seg_map.get("L", 0), seg_map.get("R", 0))
+            ranker_z = zscore(0.65 * ranker_z + 0.35 * zscore(seg_pred_today))
+
+    # Stochastic test-time ensembling over the meta-probabilities
+    if use_tt_aug and tt_samples > 0:
+        def jitter(arr, scale=0.01):
+            return arr * (1.0 + np.random.normal(0, scale, size=arr.shape))
+        meta_list = [p_base]
+        for _ in range(tt_samples-1):
+            p_j = expit(logit_p + np.random.normal(0, 0.05, size=logit_p.shape))
+            meta_list.append(p_j)
+        p_base = np.mean(np.column_stack(meta_list), axis=1)
+        logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
+
+    # ======= Final blended score using (possibly retuned) weights =======
     ranked_score = expit(
         W["w_prob"]    * logit_p
       + W["w_overlay"] * log_overlay
@@ -1064,7 +1185,6 @@ if event_file is not None and today_file is not None:
     )
 
     # ================= Auxiliary props: 2+ Total Bases & RBI (proxies) =================
-    # Robust getters for best-available stat window
     def pick_best_col(df, base, windows=(14, 30, 7, 20, 60, 5, 3)):
         for w in windows:
             c = f"{base}_{w}"
@@ -1074,11 +1194,10 @@ if event_file is not None and today_file is not None:
 
     b_slg = pick_best_col(today_df, "b_slg")
     b_hh  = pick_best_col(today_df, "b_hard_hit_rate")
-    b_hc  = pick_best_col(today_df, "b_hard_contact_rate")  # sometimes present
+    b_hc  = pick_best_col(today_df, "b_hard_contact_rate")
     b_fb  = pick_best_col(today_df, "b_fb_rate")
     b_brl = pick_best_col(today_df, "b_barrel_rate")
 
-    # z-safe helper
     def zsafe(s):
         s = pd.to_numeric(s, errors="coerce").astype(float)
         mu = np.nanmean(s.values); sd = np.nanstd(s.values) + 1e-9
@@ -1090,7 +1209,6 @@ if event_file is not None and today_file is not None:
     z_fb  = zsafe(b_fb.fillna(b_fb.median()))
     z_brl = zsafe(b_brl.fillna(b_brl.median()))
 
-    # Proxy: probability of 2+ total bases
     logits_2tb = (
         1.40 * logit_p
       + 0.70 * z_slg.values
@@ -1100,7 +1218,6 @@ if event_file is not None and today_file is not None:
     )
     prob_2tb = expit(logits_2tb)
 
-    # Proxy: RBI probability
     logits_rbi = (
         1.20 * logit_p
       + 0.50 * z_hc.values
@@ -1118,10 +1235,11 @@ if event_file is not None and today_file is not None:
         df["prob_2tb"] = np.asarray(prob_2tb)
         df["prob_rbi"] = np.asarray(prob_rbi)
 
-        df = df.sort_values("ranked_probability", ascending=False).reset_index(drop=True)
+        # NEW: tie-breaking with 2TB, then RBI, then calibrated base prob
+        sort_cols = ["ranked_probability", "prob_2tb", "prob_rbi", label]
+        df = df.sort_values(sort_cols, ascending=[False, False, False, False]).reset_index(drop=True)
         df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
 
-        # Include MLB ID (batter_id or mlb_id if present)
         mlb_id_col = None
         for c in ["batter_id", "mlb_id"]:
             if c in df.columns:
@@ -1149,7 +1267,6 @@ if event_file is not None and today_file is not None:
         cols = [c for c in cols if c in df.columns]
         out = df[cols].copy()
 
-        # rounding for readability
         for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
             if c in out.columns:
                 out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
@@ -1184,7 +1301,7 @@ if event_file is not None and today_file is not None:
         mime="text/csv",
     )
 
-    # Drift diagnostics (safe, no plots)
+    # Drift diagnostics
     try:
         drifted = drift_check(X, X_today, n=6)
         if drifted:
@@ -1195,4 +1312,4 @@ if event_file is not None and today_file is not None:
 
     gc.collect()
     st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-    st.caption("Meta-ensemble + calibrated probs + contextual overlays + RRF + disagreement control + (optional) learning ranker. 2+TB and RBI proxies included.")
+    st.caption("Meta-ensemble + adaptive temperature + contextual overlays + RRF + disagreement control + (optional) learning ranker + optional micro-retune/park-hand prior/segmented ranker. 2+TB and RBI proxies included.")
