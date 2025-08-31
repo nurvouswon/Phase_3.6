@@ -376,55 +376,66 @@ def overlay_multiplier_vectorized(df):
     return np.clip(edge, 0.68, 1.44).astype(np.float32)
 
 def weak_pitcher_factor_vectorized(df):
+    """Vectorized weak/slumping pitcher overlay using NumPy masks (no pandas NA booleans)."""
+    n = len(df)
+    factor = np.ones(n, dtype=np.float32)
+
     def pick(*names):
-        for n in names:
-            if n in df.columns:
-                return pd.to_numeric(df[n], errors="coerce")
-        return pd.Series(np.nan, index=df.index, dtype=float)
+        for ncol in names:
+            if ncol in df.columns:
+                return pd.to_numeric(df[ncol], errors="coerce").to_numpy(dtype=float)
+        return np.full(n, np.nan, dtype=float)
 
-    factor = np.ones(len(df), dtype=np.float32)
-
+    # --- Recent HR vulnerability with sample-size shrink ---
     hr3 = pick("p_rolling_hr_3", "p_hr_count_3")
     pa3 = pick("p_rolling_pa_3")
     with np.errstate(invalid='ignore', divide='ignore'):
         hr_rate_short = hr3 / pa3
     ss_shrink = np.minimum(1.0, np.nan_to_num(pa3, nan=0.0) / 30.0)
-    factor *= np.where((hr_rate_short>=0.10) & (pa3>0), (1.12 * (0.5 + 0.5*ss_shrink)), 1.0)
-    factor *= np.where((hr_rate_short>=0.07) & (hr_rate_short<0.10) & (pa3>0), (1.06 * (0.5 + 0.5*ss_shrink)), 1.0)
+    mask_pa = pa3 > 0
+    factor *= np.where((hr_rate_short >= 0.10) & mask_pa, (1.12 * (0.5 + 0.5 * ss_shrink)), 1.0)
+    factor *= np.where((hr_rate_short >= 0.07) & (hr_rate_short < 0.10) & mask_pa, (1.06 * (0.5 + 0.5 * ss_shrink)), 1.0)
 
+    # --- Contact quality allowed ---
     brl14 = pick("p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14")
     brl30 = pick("p_fs_barrel_rate_30", "p_barrel_rate_30", "p_hard_hit_rate_30")
-    qoc = np.nanmax(np.vstack([brl14.values, brl30.values]), axis=0)
-    factor *= np.where(qoc>=0.11, 1.07, 1.0)
-    factor *= np.where((qoc>=0.09) & (qoc<0.11), 1.04, 1.0)
+    qoc = np.nanmax(np.vstack([brl14, brl30]), axis=0)
+    factor *= np.where(qoc >= 0.11, 1.07, 1.0)
+    factor *= np.where((qoc >= 0.09) & (qoc < 0.11), 1.04, 1.0)
 
+    # --- Fly/ground profile ---
     fb14 = pick("p_fb_rate_14", "p_fb_rate_7", "p_fb_rate", "p_fb_pct")
     gb14 = pick("p_gb_rate_14", "p_gb_rate_7", "p_gb_rate", "p_gb_pct")
-    factor *= np.where(fb14>=0.42, 1.04, 1.0)
-    factor *= np.where((fb14>=0.38) & (fb14<0.42), 1.02, 1.0)
-    factor *= np.where((~np.isnan(gb14)) & (gb14<=0.40), 1.02, 1.0)
+    factor *= np.where(fb14 >= 0.42, 1.04, 1.0)
+    factor *= np.where((fb14 >= 0.38) & (fb14 < 0.42), 1.02, 1.0)
+    factor *= np.where((~np.isnan(gb14)) & (gb14 <= 0.40), 1.02, 1.0)
 
+    # --- Walks / damage proxies ---
     bb_rate = pick("p_bb_rate_14", "p_bb_rate_30", "p_bb_rate")
-    factor *= np.where(bb_rate>=0.09, 1.02, 1.0)
+    factor *= np.where(bb_rate >= 0.09, 1.02, 1.0)
 
     xwoba_con = pick("p_xwoba_con_14", "p_xwoba_con_30", "p_xwoba_con")
-    factor *= np.where(xwoba_con>=0.40, 1.05, 1.0)
-    factor *= np.where((xwoba_con>=0.36) & (xwoba_con<0.40), 1.03, 1.0)
+    factor *= np.where(xwoba_con >= 0.40, 1.05, 1.0)
+    factor *= np.where((xwoba_con >= 0.36) & (xwoba_con < 0.40), 1.03, 1.0)
 
+    # --- Exit velocity allowed ---
     ev_allowed = pick("p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
                       "p_exit_velocity_avg", "p_avg_exit_velo")
-    factor *= np.where(ev_allowed>=90.0, 1.03, 1.0)
+    factor *= np.where(ev_allowed >= 90.0, 1.03, 1.0)
 
-    b_hand = _hand_series(df.get("stand", df.get("batter_hand", pd.Series("R", index=df.index))))
-    p_hand = _hand_series(df.get("pitcher_hand", df.get("p_throws", pd.Series("R", index=df.index))))
-    # platoon splits
+    # --- Platoon & platoon splits ---
+    b_hand = _hand_series(df.get("stand", df.get("batter_hand", pd.Series("R", index=df.index)))).to_numpy(dtype=object)
+    p_hand = _hand_series(df.get("pitcher_hand", df.get("p_throws", pd.Series("R", index=df.index)))).to_numpy(dtype=object)
+
     vL = pick("p_hr_pa_vl_30", "p_hr_pa_vl_14", "p_hr_pa_vl")
     vR = pick("p_hr_pa_vr_30", "p_hr_pa_vr_14", "p_hr_pa_vr")
-    p_platoon_hr = np.where(b_hand=="L", vL, vR)
-    factor *= np.where(p_platoon_hr>=0.06, 1.05, 1.0)
-    factor *= np.where((p_platoon_hr>=0.04) & (p_platoon_hr<0.06), 1.03, 1.0)
+    p_platoon_hr = np.where(b_hand == "L", vL, vR)
+    factor *= np.where(p_platoon_hr >= 0.06, 1.05, 1.0)
+    factor *= np.where((p_platoon_hr >= 0.04) & (p_platoon_hr < 0.06), 1.03, 1.0)
 
-    factor *= np.where(((b_hand=="L") & (p_hand=="R")) | ((b_hand=="R") & (p_hand=="L")), 1.015, 1.0)
+    # Batter vs pitcher handedness
+    opp_platoon = ((b_hand == "L") & (p_hand == "R")) | ((b_hand == "R") & (p_hand == "L"))
+    factor *= np.where(opp_platoon, 1.015, 1.0)
 
     return np.clip(factor, 0.90, 1.18).astype(np.float32)
 
