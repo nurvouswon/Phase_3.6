@@ -10,7 +10,11 @@
 # - Park/hand Bayesian prior blend into p_base
 # - Handedness-segmented models + small TT-Aug (B=3)
 # - Polynomial crosses removed (no toggles)
-# - NEW: Vectorized overlay/weather (fast) + defragment + debug
+# - PERF/ROBUSTNESS FIXES:
+#     • TE columns batch-assign to avoid fragmentation warnings
+#     • Vectorized overlays (fast) + NA-safe boolean math
+#     • TT-Aug noise std aligned to X_today (fix shape mismatch)
+#     • Leaderboard rounding fully Series/array-safe
 # ============================================================
 
 import streamlit as st
@@ -169,8 +173,7 @@ def oof_target_encode(values, y, dates, folds, global_prior=None, smoothing=50.0
         final_map[v] = (c * m + smoothing * global_prior) / (c + smoothing)
 
     return oof, final_map, float(global_prior)
-
-# ---------------- Embargoed time splits ----------------
+    # ---------------- Embargoed time splits ----------------
 def embargo_time_splits(dates_series, n_splits=2, embargo_days=1):
     dates = pd.to_datetime(dates_series).reset_index(drop=True)
     u_days = pd.Series(dates.dt.floor("D")).dropna().unique()
@@ -210,305 +213,230 @@ def tune_temperature_for_topk_adaptive(p_oof, y, K=None, T_grid=np.linspace(0.8,
             best_hits, best_T = hits, float(T)
     return best_T, K, int(best_hits)
 
-# ===================== Overlays & Ratings (vectorized) =====================
-def _hand_series(b_hand_series):
-    s = b_hand_series.astype(str).str.upper().fillna("R")
-    s = s.where(s.isin(["L","R"]), "R")
-    return s
+# ===================== Overlays & Ratings =====================
+def _getv(row, keys, default=np.nan):
+    for k in keys:
+        if k in row and pd.notnull(row[k]):
+            return row[k]
+    return default
 
-def rate_weather_vectorized(df):
-    # temp ratings
-    temp = pd.to_numeric(df.get("temp", pd.Series(np.nan, index=df.index)), errors="coerce")
-    temp_rating = pd.Series("?", index=df.index, dtype=object)
-    temp_rating = temp_rating.mask((temp>=75)&(temp<=85), "Excellent")
-    temp_rating = temp_rating.mask(((temp>=68)&(temp<75))|((temp>85)&(temp<=90)), "Good")
-    temp_rating = temp_rating.mask(((temp>=60)&(temp<68))|((temp>90)&(temp<=95)), "Fair")
-    temp_rating = temp_rating.mask((temp<60)|(temp>95), "Poor")
+def _hand(row, batter=True):
+    return str(_getv(row, ["stand","batter_hand"] if batter else ["pitcher_hand","p_throws"], "R")).upper() or "R"
 
-    # humidity ratings
-    hum = pd.to_numeric(df.get("humidity", pd.Series(np.nan, index=df.index)), errors="coerce")
-    humidity_rating = pd.Series("?", index=df.index, dtype=object)
-    humidity_rating = humidity_rating.mask(hum>=60, "Excellent")
-    humidity_rating = humidity_rating.mask((hum>=45)&(hum<60), "Good")
-    humidity_rating = humidity_rating.mask((hum>=30)&(hum<45), "Fair")
-    humidity_rating = humidity_rating.mask(hum<30, "Poor")
+def overlay_multiplier(row):
+    EDGE_MIN, EDGE_MAX = 0.68, 1.44
+    PULL_HI, PULL_LO   = 0.35, 0.28
+    FB_HI_P, FB_HI_B   = 0.25, 0.22
+    BARREL_HI, BARREL_MID = 0.12, 0.08
+    HOT_HR_HI, HOT_HR_LO = 0.09, 0.025
 
-    # wind ratings
-    wind = pd.to_numeric(df.get("wind_mph", pd.Series(np.nan, index=df.index)), errors="coerce")
-    wdir = df.get("wind_dir_string", pd.Series("", index=df.index)).astype(str).str.lower()
-    wind_in = wdir.str.contains(" in") | wdir.str.contains("in ")
-    wind_rating = pd.Series("?", index=df.index, dtype=object)
-    wind_rating = wind_rating.mask(wind<6, "Excellent")
-    wind_rating = wind_rating.mask((wind>=6)&(wind<12), "Good")
-    wind_rating = wind_rating.mask((wind>=12)&(wind<18), np.where(wind_in, "Fair", "Good"))
-    wind_rating = wind_rating.mask(wind>=18, np.where(wind_in, "Poor", "Fair"))
+    edge = 1.0
+    b_hand = _hand(row, True)
+    p_hand = _hand(row, False)
 
-    # condition ratings
-    cond = df.get("condition", pd.Series("", index=df.index)).astype(str).str.lower()
-    condition_rating = pd.Series("?", index=df.index, dtype=object)
-    condition_rating = condition_rating.mask(cond.str.contains("clear|sun|outdoor"), "Excellent")
-    condition_rating = condition_rating.mask(cond.str.contains("cloud|partly"), "Good")
-    condition_rating = condition_rating.mask(cond.str.contains("rain|fog"), "Poor")
-    condition_rating = condition_rating.mask(~cond.isin(["","unknown","none","na"]), "Fair")
+    temp     = _getv(row, ["temp"])
+    humidity = _getv(row, ["humidity"])
+    wind     = _getv(row, ["wind_mph"])
+    wind_dir = str(_getv(row, ["wind_dir_string"], "")).lower().strip()
+    roof     = str(_getv(row, ["roof_status"], "")).lower().strip()
+    altitude = _getv(row, ["park_altitude"])
 
-    return dict(
-        temp=temp, humidity=hum, wind_mph=wind, wind_dir_string=wdir,
-        temp_rating=temp_rating, humidity_rating=humidity_rating,
-        wind_rating=wind_rating, condition_rating=condition_rating
-    )
+    pf_base  = _getv(row, ["park_hr_rate", "park_hand_hr_rate", "park_hr_pct_hand"])
+    pf_rhb   = _getv(row, ["park_hr_pct_rhb"])
+    pf_lhb   = _getv(row, ["park_hr_pct_lhb"])
+    pf_hand  = pf_rhb if b_hand == "R" else pf_lhb if b_hand == "L" else np.nan
 
-def overlay_multiplier_vectorized(df):
-    # hands
-    b_hand = _hand_series(df.get("stand", df.get("batter_hand", pd.Series("R", index=df.index))))
-    p_hand = _hand_series(df.get("pitcher_hand", df.get("p_throws", pd.Series("R", index=df.index))))
-    # env
-    temp = pd.to_numeric(df.get("temp", pd.Series(np.nan, index=df.index)), errors="coerce")
-    hum  = pd.to_numeric(df.get("humidity", pd.Series(np.nan, index=df.index)), errors="coerce")
-    wind = pd.to_numeric(df.get("wind_mph", pd.Series(np.nan, index=df.index)), errors="coerce")
-    wdir = df.get("wind_dir_string", pd.Series("", index=df.index)).astype(str).str.lower()
-    roof = df.get("roof_status", pd.Series("", index=df.index)).astype(str).str.lower()
-    altitude = pd.to_numeric(df.get("park_altitude", pd.Series(np.nan, index=df.index)), errors="coerce")
+    def _cap_pf(x):
+        try: return max(0.80, min(1.22, float(x)))
+        except Exception: return np.nan
 
-    # park factors (cap)
-    def cap_pf(s):
-        s = pd.to_numeric(s, errors="coerce")
-        return s.clip(lower=0.80, upper=1.22)
+    pfs = [pf_hand, pf_base]
+    pfs = [_cap_pf(x) for x in pfs if pd.notnull(x)]
+    if pfs: edge *= pfs[0]
 
-    pf_base = cap_pf(df.get("park_hr_rate", df.get("park_hand_hr_rate", df.get("park_hr_pct_hand", np.nan))))
-    pf_rhb = cap_pf(df.get("park_hr_pct_rhb", np.nan))
-    pf_lhb = cap_pf(df.get("park_hr_pct_lhb", np.nan))
-    pf_hand = np.where(b_hand=="R", pf_rhb, pf_lhb)
+    b_pull = _getv(row, ["b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3"])
+    b_fb   = _getv(row, ["b_fb_rate_7","b_fb_rate_14","b_fb_rate_5","b_fb_rate_3"])
+    b_brl  = _getv(row, ["b_barrel_rate_7","b_barrel_rate_14","b_barrel_rate_5","b_barrel_rate_3"])
+    b_hot  = _getv(row, ["b_hr_per_pa_7","b_hr_per_pa_5","b_hr_per_pa_3"])
 
-    edge = np.ones(len(df), dtype=np.float32)
-    # apply hand-specific park if available, else base
-    pf_used = np.where(np.isfinite(pf_hand), pf_hand, pf_base)
-    pf_used = np.where(np.isfinite(pf_used), pf_used, 1.0)
-    edge *= pf_used
+    if pd.notnull(b_brl):
+        if b_brl >= BARREL_HI: edge *= 1.04
+        elif b_brl >= BARREL_MID: edge *= 1.02
 
-    # short window stats
-    def pick_first(*cols):
-        for c in cols:
-            if c in df.columns:
-                s = pd.to_numeric(df[c], errors="coerce")
-                if s.notna().any(): return s
-        return pd.Series(np.nan, index=df.index, dtype=float)
+    if pd.notnull(b_hot):
+        if b_hot > HOT_HR_HI: edge *= 1.04
+        elif b_hot < HOT_HR_LO: edge *= 0.97
 
-    b_brl = pick_first("b_barrel_rate_7","b_barrel_rate_14","b_barrel_rate_5","b_barrel_rate_3")
-    b_hot = pick_first("b_hr_per_pa_7","b_hr_per_pa_5","b_hr_per_pa_3")
-    b_fb  = pick_first("b_fb_rate_7","b_fb_rate_14","b_fb_rate_5","b_fb_rate_3")
-    p_fb  = pick_first("p_fb_rate_14","p_fb_rate_7","p_fb_rate")
+    p_fb = _getv(row, ["p_fb_rate_14","p_fb_rate_7","p_fb_rate"])
 
-    # BRL nudges
-    edge *= np.where((~np.isnan(b_brl)) & (b_brl>=0.12), 1.04, 1.0)
-    edge *= np.where((~np.isnan(b_brl)) & (b_brl>=0.08) & (b_brl<0.12), 1.02, 1.0)
+    roof_closed = ("closed" in roof) or ("indoor" in roof) or ("domed" in roof)
 
-    # HOT nudges
-    edge *= np.where((~np.isnan(b_hot)) & (b_hot>0.09), 1.04, 1.0)
-    edge *= np.where((~np.isnan(b_hot)) & (b_hot<0.025), 0.97, 1.0)
+    if pd.notnull(p_fb) and float(p_fb) >= 0.40:
+        if (pd.notnull(temp) and temp >= 75) and (pd.notnull(wind) and wind >= 7 and "out" in wind_dir) and not roof_closed:
+            edge *= 1.02
 
-    # roof flag
-    roof_closed = roof.str.contains("closed|indoor|domed", regex=True)
+    if pd.notnull(altitude):
+        if altitude >= 5000: edge *= 1.05
+        elif altitude >= 3000: edge *= 1.02
 
-    # p_fb high + warm + out wind
-    out_mask = wdir.str.contains("out")
-    edge *= np.where((~np.isnan(p_fb)) & (p_fb>=0.40) & (~np.isnan(temp)) & (temp>=75) &
-                     (~np.isnan(wind)) & (wind>=7) & out_mask & (~roof_closed), 1.02, 1.0)
+    if pd.notnull(temp):
+        edge *= 1.035 ** ((temp - 70) / 10.0)
+    if pd.notnull(humidity):
+        if humidity >= 65: edge *= 1.02
+        elif humidity <= 35: edge *= 0.98
 
-    # altitude
-    edge *= np.where((~np.isnan(altitude)) & (altitude>=5000), 1.05, 1.0)
-    edge *= np.where((~np.isnan(altitude)) & (altitude>=3000) & (altitude<5000), 1.02, 1.0)
+    pulled_field = "lf" if b_hand == "R" else "rf"
+    wind_factor = 1.0
+    if pd.notnull(wind) and wind >= 6 and wind_dir:
+        out = ("out" in wind_dir); inn = ("in" in wind_dir)
+        has_lf = "lf" in wind_dir; has_rf = "rf" in wind_dir
+        has_cf = ("cf" in wind_dir) or ("center" in wind_dir)
 
-    # temp / humidity base effects
-    edge *= np.where(~np.isnan(temp), 1.035 ** ((temp - 70.0) / 10.0), 1.0)
-    edge *= np.where((~np.isnan(hum)) & (hum>=65), 1.02, 1.0)
-    edge *= np.where((~np.isnan(hum)) & (hum<=35), 0.98, 1.0)
+        hi_pull = pd.notnull(b_pull) and (b_pull >= PULL_HI)
+        lo_pull = pd.notnull(b_pull) and (b_pull <= PULL_LO)
+        hi_bfb  = pd.notnull(b_fb)   and (b_fb   >= FB_HI_B)
+        hi_pfb  = pd.notnull(p_fb)   and (p_fb   >= FB_HI_P)
 
-    # wind geometry
-    pulled_field = np.where(b_hand=="R","lf","rf")
-    has_lf = wdir.str.contains("lf"); has_rf = wdir.str.contains("rf")
-    has_cf = wdir.str.contains("cf") | wdir.str.contains("center")
-    inn = wdir.str.contains(" in") | wdir.str.contains("in ")
-    out = out_mask
+        OUT_CF_BOOST, OUT_PULL_BOOST, OPPO_TINY = 1.11, 1.20, 1.05
+        IN_CF_FADE, IN_PULL_FADE = 0.92, 0.85
 
-    hi_bfb = (~np.isnan(b_fb)) & (b_fb>=0.22)
-    hi_pfb = (~np.isnan(p_fb)) & (p_fb>=0.25)
-    hi_pull = (~np.isnan(pick_first("b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3"))) & \
-              (pick_first("b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3")>=0.35)
-    lo_pull = (~np.isnan(pick_first("b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3"))) & \
-              (pick_first("b_pull_rate_7","b_pull_rate_14","b_pull_rate_5","b_pull_rate_3")<=0.28)
+        if has_cf and hi_bfb: wind_factor *= OUT_CF_BOOST if out else IN_CF_FADE if inn else 1.0
+        if has_lf and pulled_field == "lf" and hi_pull: wind_factor *= OUT_PULL_BOOST if out else IN_PULL_FADE if inn else 1.0
+        if has_rf and pulled_field == "rf" and hi_pull: wind_factor *= OUT_PULL_BOOST if out else IN_PULL_FADE if inn else 1.0
 
-    OUT_CF_BOOST, OUT_PULL_BOOST, OPPO_TINY = 1.11, 1.20, 1.05
-    IN_CF_FADE, IN_PULL_FADE = 0.92, 0.85
+        if out and lo_pull:
+            if has_lf and pulled_field == "rf": wind_factor *= OPPO_TINY
+            if has_rf and pulled_field == "lf": wind_factor *= OPPO_TINY
 
-    edge *= np.where(has_cf & hi_bfb & out, OUT_CF_BOOST, 1.0)
-    edge *= np.where(has_cf & hi_bfb & inn, IN_CF_FADE, 1.0)
+        if hi_pfb and (out or inn): wind_factor *= 1.05 if out else 0.97
+        if roof_closed: wind_factor = 1.0 + (wind_factor - 1.0) * 0.35
 
-    edge *= np.where(has_lf & (pulled_field=="lf") & hi_pull & out, OUT_PULL_BOOST, 1.0)
-    edge *= np.where(has_lf & (pulled_field=="lf") & hi_pull & inn, IN_PULL_FADE, 1.0)
-    edge *= np.where(has_rf & (pulled_field=="rf") & hi_pull & out, OUT_PULL_BOOST, 1.0)
-    edge *= np.where(has_rf & (pulled_field=="rf") & hi_pull & inn, IN_PULL_FADE, 1.0)
+        if out or inn:
+            extra = max(0.0, (wind - 8.0) / 3.0)
+            wind_factor *= min(1.08, 1.0 + 0.01 * extra) if out else max(0.92, 1.0 - 0.01 * extra)
 
-    edge *= np.where(out & lo_pull & has_lf & (pulled_field=="rf"), OPPO_TINY, 1.0)
-    edge *= np.where(out & lo_pull & has_rf & (pulled_field=="lf"), OPPO_TINY, 1.0)
+    edge *= wind_factor
 
-    edge *= np.where(hi_pfb & (out|inn) & out, 1.05, 1.0)
-    edge *= np.where(hi_pfb & (out|inn) & inn, 0.97, 1.0)
-
-    # wind strength modifier (attenuated indoors)
-    wind_extra = np.maximum(0.0, (np.nan_to_num(wind, nan=0.0) - 8.0) / 3.0)
-    out_mod = np.minimum(1.08, 1.0 + 0.01 * wind_extra)
-    in_mod  = np.maximum(0.92, 1.0 - 0.01 * wind_extra)
-    edge *= np.where(out, out_mod, 1.0)
-    edge *= np.where(inn, in_mod, 1.0)
-    edge = np.where(roof_closed, 1.0 + (edge - 1.0) * 0.35, edge)
-
-    # combined temp/wind check
-    edge *= np.where((~np.isnan(temp)) & (~np.isnan(wind)) &
-                     (temp>=75) & (wind>=7) & out & (~roof_closed), 1.05, 1.0)
-    edge *= np.where((~np.isnan(temp)) & (~np.isnan(wind)) &
-                     (temp>=65) & (wind>=5) & (~roof_closed), 1.02, 1.0)
-    edge *= np.where((~np.isnan(temp)) & (~np.isnan(wind)) &
-                     ~((temp>=65)&(wind>=5)) & ~((temp>=75)&(wind>=7)&out) , 0.985, 1.0)
-
-    # platoon
-    edge *= np.where(b_hand!=p_hand, 1.01, 0.995)
-
-    return np.clip(edge, 0.68, 1.44).astype(np.float32)
-
-def weak_pitcher_factor_vectorized(df):
-    """Vectorized weak/slumping pitcher overlay using NumPy masks (no pandas NA booleans)."""
-    n = len(df)
-    factor = np.ones(n, dtype=np.float32)
-
-    def pick(*names):
-        for ncol in names:
-            if ncol in df.columns:
-                return pd.to_numeric(df[ncol], errors="coerce").to_numpy(dtype=float)
-        return np.full(n, np.nan, dtype=float)
-
-    # --- Recent HR vulnerability with sample-size shrink ---
-    hr3 = pick("p_rolling_hr_3", "p_hr_count_3")
-    pa3 = pick("p_rolling_pa_3")
-    with np.errstate(invalid='ignore', divide='ignore'):
-        hr_rate_short = hr3 / pa3
-    ss_shrink = np.minimum(1.0, np.nan_to_num(pa3, nan=0.0) / 30.0)
-    mask_pa = pa3 > 0
-    factor *= np.where((hr_rate_short >= 0.10) & mask_pa, (1.12 * (0.5 + 0.5 * ss_shrink)), 1.0)
-    factor *= np.where((hr_rate_short >= 0.07) & (hr_rate_short < 0.10) & mask_pa, (1.06 * (0.5 + 0.5 * ss_shrink)), 1.0)
-
-    # --- Contact quality allowed ---
-    brl14 = pick("p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14")
-    brl30 = pick("p_fs_barrel_rate_30", "p_barrel_rate_30", "p_hard_hit_rate_30")
-    qoc = np.nanmax(np.vstack([brl14, brl30]), axis=0)
-    factor *= np.where(qoc >= 0.11, 1.07, 1.0)
-    factor *= np.where((qoc >= 0.09) & (qoc < 0.11), 1.04, 1.0)
-
-    # --- Fly/ground profile ---
-    fb14 = pick("p_fb_rate_14", "p_fb_rate_7", "p_fb_rate", "p_fb_pct")
-    gb14 = pick("p_gb_rate_14", "p_gb_rate_7", "p_gb_rate", "p_gb_pct")
-    factor *= np.where(fb14 >= 0.42, 1.04, 1.0)
-    factor *= np.where((fb14 >= 0.38) & (fb14 < 0.42), 1.02, 1.0)
-    factor *= np.where((~np.isnan(gb14)) & (gb14 <= 0.40), 1.02, 1.0)
-
-    # --- Walks / damage proxies ---
-    bb_rate = pick("p_bb_rate_14", "p_bb_rate_30", "p_bb_rate")
-    factor *= np.where(bb_rate >= 0.09, 1.02, 1.0)
-
-    xwoba_con = pick("p_xwoba_con_14", "p_xwoba_con_30", "p_xwoba_con")
-    factor *= np.where(xwoba_con >= 0.40, 1.05, 1.0)
-    factor *= np.where((xwoba_con >= 0.36) & (xwoba_con < 0.40), 1.03, 1.0)
-
-    # --- Exit velocity allowed ---
-    ev_allowed = pick("p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
-                      "p_exit_velocity_avg", "p_avg_exit_velo")
-    factor *= np.where(ev_allowed >= 90.0, 1.03, 1.0)
-
-    # --- Platoon & platoon splits ---
-    b_hand = _hand_series(df.get("stand", df.get("batter_hand", pd.Series("R", index=df.index)))).to_numpy(dtype=object)
-    p_hand = _hand_series(df.get("pitcher_hand", df.get("p_throws", pd.Series("R", index=df.index)))).to_numpy(dtype=object)
-
-    vL = pick("p_hr_pa_vl_30", "p_hr_pa_vl_14", "p_hr_pa_vl")
-    vR = pick("p_hr_pa_vr_30", "p_hr_pa_vr_14", "p_hr_pa_vr")
-    p_platoon_hr = np.where(b_hand == "L", vL, vR)
-    factor *= np.where(p_platoon_hr >= 0.06, 1.05, 1.0)
-    factor *= np.where((p_platoon_hr >= 0.04) & (p_platoon_hr < 0.06), 1.03, 1.0)
-
-    # Batter vs pitcher handedness
-    opp_platoon = ((b_hand == "L") & (p_hand == "R")) | ((b_hand == "R") & (p_hand == "L"))
-    factor *= np.where(opp_platoon, 1.015, 1.0)
-
-    return np.clip(factor, 0.90, 1.18).astype(np.float32)
-
-def short_term_hot_factor_vectorized(df):
-    ev = pd.to_numeric(df.get("b_avg_exit_velo_5", df.get("b_avg_exit_velo_3", np.nan)), errors="coerce")
-    la = pd.to_numeric(df.get("b_la_mean_5", df.get("b_la_mean_3", np.nan)), errors="coerce")
-    br = pd.to_numeric(df.get("b_barrel_rate_5", df.get("b_barrel_rate_3", np.nan)), errors="coerce")
-    factor = np.ones(len(df), dtype=np.float32)
-    factor *= np.where((~np.isnan(ev)) & (ev>=91), 1.03, 1.0)
-    factor *= np.where((~np.isnan(la)) & (la>=12) & (la<=24), 1.02, 1.0)
-    factor *= np.where((~np.isnan(br)) & (br>=0.12), 1.05, 1.0)
-    factor *= np.where((~np.isnan(br)) & (br>=0.08) & (br<0.12), 1.02, 1.0)
-    return np.clip(factor, 0.96, 1.10).astype(np.float32)
-
-def compute_overlay_cols_vectorized(df):
-    """Vectorized replacement for the old row-wise apply chain."""
-    # ratings
-    ratings = rate_weather_vectorized(df)
-    # overlays
-    overlay = overlay_multiplier_vectorized(df)
-    weak_p  = weak_pitcher_factor_vectorized(df)
-    hot_b   = short_term_hot_factor_vectorized(df)
-
-    final_raw = np.clip(
-        np.clip(overlay, 0.68, 1.44) * weak_p * hot_b, 0.60, 1.65
-    ).astype(np.float32)
-
-    roof = df.get("roof_status", pd.Series("", index=df.index)).astype(str).str.lower()
-    roof_closed = roof.str.contains("closed|indoor|domed", regex=True)
-    has_temp = ratings["temp"].notna()
-    has_hum  = ratings["humidity"].notna()
-    has_wind = ratings["wind_mph"].notna()
-    conf_base = (has_temp.astype(float) + has_hum.astype(float) + has_wind.astype(float)) / 3.0
-    conf_roof = np.where(roof_closed, 0.35, 1.0)
-    confidence = np.clip(conf_base * conf_roof, 0.0, 1.0)
-    alpha = 0.5 + 0.5 * confidence
-    final_mult = (1.0 + alpha * (final_raw - 1.0)).astype(np.float32)
-
-    # build once, then concat -> avoids fragmentation
-    new_cols = {
-        "temp_rating": ratings["temp_rating"],
-        "humidity_rating": ratings["humidity_rating"],
-        "wind_rating": ratings["wind_rating"],
-        "condition_rating": ratings["condition_rating"],
-        "overlay_multiplier": overlay,
-        "weak_pitcher_factor": weak_p,
-        "hot_streak_factor": hot_b,
-        "final_multiplier_raw": final_raw,
-        "final_multiplier": final_mult
-    }
-    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def compute_overlay_cols_cached(df_like):
-    # cache by a hash of shapes/columns to avoid recompute on reruns
-    df_proc = compute_overlay_cols_vectorized(df_like)
-    # defragment once
-    return df_proc.copy()
-
-def debug_mem(label, df=None):
-    try:
-        rss = psutil.Process().memory_info().rss / (1024**2)
-        if df is None:
-            st.write(f"🔎 {label}: RSS={rss:.1f} MB")
+    if pd.notnull(temp) and pd.notnull(wind):
+        if (temp >= 75 and wind >= 7 and "out" in wind_dir) and not roof_closed:
+            edge *= 1.05
+        elif temp >= 65 and wind >= 5 and not roof_closed:
+            edge *= 1.02
         else:
-            mem = df.memory_usage(deep=True).sum() / (1024**2)
-            st.write(f"🔎 {label}: df.shape={df.shape}, df_mem={mem:.1f} MB, RSS={rss:.1f} MB")
-    except Exception:
-        pass
+            edge *= 0.985
 
-# ===================== APP START =====================
+    if b_hand != p_hand: edge *= 1.01
+    else: edge *= 0.995
 
-# Optional learning ranker upload (fail-closed if mismatch)
+    return float(np.clip(edge, EDGE_MIN, EDGE_MAX))
+
+def rate_weather(row):
+    ratings = {}
+    temp = _getv(row, ["temp"])
+    if pd.isna(temp): ratings["temp_rating"]="?"
+    elif 75 <= temp <= 85: ratings["temp_rating"]="Excellent"
+    elif 68 <= temp < 75 or 85 < temp <= 90: ratings["temp_rating"]="Good"
+    elif 60 <= temp < 68 or 90 < temp <= 95: ratings["temp_rating"]="Fair"
+    else: ratings["temp_rating"]="Poor"
+
+    hum = _getv(row, ["humidity"])
+    if pd.isna(hum): ratings["humidity_rating"]="?"
+    elif hum >= 60: ratings["humidity_rating"]="Excellent"
+    elif 45 <= hum < 60: ratings["humidity_rating"]="Good"
+    elif 30 <= hum < 45: ratings["humidity_rating"]="Fair"
+    else: ratings["humidity_rating"]="Poor"
+
+    wind = _getv(row, ["wind_mph"]); wdir = str(_getv(row, ["wind_dir_string"], "")).lower()
+    if pd.isna(wind): ratings["wind_rating"]="?"
+    elif wind < 6: ratings["wind_rating"]="Excellent"
+    elif 6 <= wind < 12: ratings["wind_rating"]="Good"
+    elif 12 <= wind < 18: ratings["wind_rating"]="Fair" if "in" in wdir else "Good"
+    else: ratings["wind_rating"]="Poor" if "in" in wdir else "Fair"
+
+    cond = str(_getv(row, ["condition"], "")).lower()
+    if not cond or cond in ("unknown","none","na"): ratings["condition_rating"]="?"
+    elif "clear" in cond or "sun" in cond or "outdoor" in cond: ratings["condition_rating"]="Excellent"
+    elif "cloud" in cond or "partly" in cond: ratings["condition_rating"]="Good"
+    elif "rain" in cond or "fog" in cond: ratings["condition_rating"]="Poor"
+    else: ratings["condition_rating"]="Fair"
+    return pd.Series(ratings)
+
+def weak_pitcher_factor(row):
+    def _get(*names, default=np.nan):
+        for n in names:
+            if n in row and pd.notnull(row[n]): return row[n]
+        return default
+
+    factor = 1.0
+    hr3   = _get("p_rolling_hr_3", "p_hr_count_3")
+    pa3   = _get("p_rolling_pa_3")
+    if pd.notnull(hr3) and pd.notnull(pa3) and pa3 > 0:
+        hr_rate_short = float(hr3) / float(pa3)
+        ss_shrink = min(1.0, pa3 / 30.0)
+        if hr_rate_short >= 0.10: factor *= (1.12 * (0.5 + 0.5 * ss_shrink))
+        elif hr_rate_short >= 0.07: factor *= (1.06 * (0.5 + 0.5 * ss_shrink))
+
+    brl14 = _get("p_fs_barrel_rate_14", "p_barrel_rate_14", "p_hard_hit_rate_14")
+    brl30 = _get("p_fs_barrel_rate_30", "p_barrel_rate_30", "p_hard_hit_rate_30")
+    qoc = np.nanmax([brl14, brl30]) if any(pd.notnull(x) for x in [brl14, brl30]) else np.nan
+    if pd.notnull(qoc):
+        v = float(qoc)
+        if v >= 0.11: factor *= 1.07
+        elif v >= 0.09: factor *= 1.04
+
+    fb14 = _get("p_fb_rate_14", "p_fb_rate_7", "p_fb_rate", "p_fb_pct")
+    gb14 = _get("p_gb_rate_14", "p_gb_rate_7", "p_gb_rate", "p_gb_pct")
+    if pd.notnull(fb14):
+        if float(fb14) >= 0.42: factor *= 1.04
+        elif float(fb14) >= 0.38: factor *= 1.02
+    if pd.notnull(gb14) and float(gb14) <= 0.40: factor *= 1.02
+
+    bb_rate = _get("p_bb_rate_14", "p_bb_rate_30", "p_bb_rate")
+    xwoba_con = _get("p_xwoba_con_14", "p_xwoba_con_30", "p_xwoba_con")
+    if pd.notnull(bb_rate) and float(bb_rate) >= 0.09: factor *= 1.02
+    if pd.notnull(xwoba_con):
+        if float(xwoba_con) >= 0.40: factor *= 1.05
+        elif float(xwoba_con) >= 0.36: factor *= 1.03
+
+    ev_allowed = _get("p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30",
+                      "p_exit_velocity_avg", "p_avg_exit_velo")
+    if pd.notnull(ev_allowed) and float(ev_allowed) >= 90.0: factor *= 1.03
+
+    b_hand = str(_get("stand", "batter_hand", default="R")).upper()
+    p_hand = str(_get("pitcher_hand", "p_throws", default="R")).upper()
+    if b_hand == "L":
+        p_platoon_hr = _get("p_hr_pa_vl_30", "p_hr_pa_vl_14", "p_hr_pa_vl")
+    else:
+        p_platoon_hr = _get("p_hr_pa_vr_30", "p_hr_pa_vr_14", "p_hr_pa_vr")
+    if pd.notnull(p_platoon_hr):
+        v = float(p_platoon_hr)
+        if v >= 0.06: factor *= 1.05
+        elif v >= 0.04: factor *= 1.03
+
+    if (b_hand == "L" and p_hand == "R") or (b_hand == "R" and p_hand == "L"): factor *= 1.015
+    return float(np.clip(factor, 0.90, 1.18))
+
+def short_term_hot_factor(row):
+    def _first_non_null(row, *cands, default=np.nan):
+        for c in cands:
+            if c in row and pd.notnull(row[c]): return row[c]
+        return default
+    ev = _first_non_null(row, "b_avg_exit_velo_5", "b_avg_exit_velo_3")
+    la = _first_non_null(row, "b_la_mean_5", "b_la_mean_3")
+    br = _first_non_null(row, "b_barrel_rate_5", "b_barrel_rate_3")
+    factor = 1.0
+    try:
+        if pd.notnull(ev) and float(ev) >= 91: factor *= 1.03
+        if pd.notnull(la) and 12 <= float(la) <= 24: factor *= 1.02
+        if pd.notnull(br):
+            if float(br) >= 0.12: factor *= 1.05
+            elif float(br) >= 0.08: factor *= 1.02
+    except: pass
+    return float(np.clip(factor, 0.96, 1.10))
+
+# ===================== APP CONTINUATION =====================
+
+# Optional learning ranker upload (we'll fail closed if not perfect match)
 lr_file = st.file_uploader("Optional: upload learning_ranker.pkl", type=["pkl"], key="lrpk")
 
 event_file = st.file_uploader("Upload Event-Level CSV/Parquet for Training (required)", type=['csv', 'parquet'], key='eventcsv')
@@ -526,8 +454,9 @@ if event_file is not None and today_file is not None:
         event_df = fix_types(dedup_columns(event_df.dropna(axis=1, how='all'))).reset_index(drop=True)
         today_df = fix_types(dedup_columns(today_df.dropna(axis=1, how='all'))).reset_index(drop=True)
 
-        debug_mem("Loaded event_df", event_df)
-        debug_mem("Loaded today_df", today_df)
+        st.write(f"event_df shape: {event_df.shape}, today_df shape: {today_df.shape}")
+        st.write(f"event_df memory (MB): {event_df.memory_usage(deep=True).sum() / 1024**2:.2f}")
+        st.write(f"today_df memory (MB): {today_df.memory_usage(deep=True).sum() / 1024**2:.2f}")
 
     target_col = 'hr_outcome'
     if target_col not in event_df.columns:
@@ -589,7 +518,7 @@ if event_file is not None and today_file is not None:
     else:
         dates_aligned = pd.Series(pd.Timestamp("2000-01-01"), index=X.index)
 
-    # ---- Outlier removal (prevents tail explosions) ----
+    # ---- Outlier removal ----
     st.write("🚦 Outlier removal...")
     X_filtered, y_filtered = remove_outliers(X, y, method="iforest", contamination=0.012)
     dates_aligned = dates_aligned.loc[X_filtered.index].reset_index(drop=True)
@@ -635,93 +564,75 @@ if event_file is not None and today_file is not None:
         s = series.fillna("__NA__").astype(str)
         return s.map(lambda v: fmap.get(v, gmean)).astype(np.float32)
 
-    # Map all TE to today at once (avoid fragmentation)
-    te_today = {}
+    # add TE columns to TODAY in one concat (avoids fragmentation)
+    te_today_parts = {}
     if "park" in today_df.columns:
-        te_today["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
+        te_today_parts["te_park"] = _map_series_to_te(today_df["park"], te_maps.get("te_park", {}), global_means.get("te_park", y.mean()))
     if "team_code" in today_df.columns:
-        te_today["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
+        te_today_parts["te_team"] = _map_series_to_te(today_df["team_code"], te_maps.get("te_team", {}), global_means.get("te_team", y.mean()))
     if set(["park","batter_hand"]).issubset(today_df.columns):
-        te_today["te_park_hand"] = _map_series_to_te(_combo(today_df["park"], today_df["batter_hand"]),
-                                                     te_maps.get("te_park_hand", {}), global_means.get("te_park_hand", y.mean()))
+        te_today_parts["te_park_hand"] = _map_series_to_te(_combo(today_df["park"], today_df["batter_hand"]),
+                                                           te_maps.get("te_park_hand", {}), global_means.get("te_park_hand", y.mean()))
     if set(["pitcher_team_code","batter_hand"]).issubset(today_df.columns):
-        te_today["te_pteam_hand"] = _map_series_to_te(_combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
-                                                      te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
-    if te_today:
-        X_today = pd.concat([X_today, pd.DataFrame(te_today, index=X_today.index)], axis=1)
-        X_today = X_today.copy()  # defragment
+        te_today_parts["te_pteam_hand"] = _map_series_to_te(_combo(today_df["pitcher_team_code"], today_df["batter_hand"]),
+                                                            te_maps.get("te_pteam_hand", {}), global_means.get("te_pteam_hand", y.mean()))
+    if te_today_parts:
+        X_today = pd.concat([X_today, pd.DataFrame(te_today_parts, index=X_today.index)], axis=1).astype(np.float32)
 
-    # ---------- Build overlay features for TRAIN (vectorized, cached) ----------
+    # ---------- Build overlay features for TRAIN (aligned copy) ----------
     event_aligned = event_df.copy()
     if order_idx is not None: event_aligned = event_aligned.loc[order_idx].reset_index(drop=True)
     event_aligned = event_aligned.loc[X.index].reset_index(drop=True)
 
-    debug_mem("Before overlay TRAIN", event_aligned)
-    event_aligned = compute_overlay_cols_cached(event_aligned)
-    event_aligned = event_aligned.copy()  # defragment
-    debug_mem("After overlay TRAIN", event_aligned)
+    def compute_overlay_cols(df):
+        df = df.copy()
+        ratings_df = df.apply(rate_weather, axis=1)
+        for col in ratings_df.columns: df[col] = ratings_df[col]
+        df["overlay_multiplier"] = df.apply(overlay_multiplier, axis=1)
+        df["weak_pitcher_factor"] = df.apply(weak_pitcher_factor, axis=1).astype(np.float32)
+        df["hot_streak_factor"]   = df.apply(short_term_hot_factor, axis=1).astype(np.float32)
+        df["final_multiplier_raw"] = (
+            df["overlay_multiplier"].astype(float).clip(0.68, 1.44)
+            * df["weak_pitcher_factor"].astype(float)
+            * df["hot_streak_factor"].astype(float)
+        ).clip(0.60, 1.65).astype(np.float32)
+        roof = df.get("roof_status", pd.Series("", index=df.index)).astype(str).str.lower()
+        roof_closed = roof.str.contains("closed|indoor|domed", regex=True)
+        has_temp = df["temp"].notna() if "temp" in df.columns else pd.Series(False, index=df.index)
+        has_hum  = df["humidity"].notna() if "humidity" in df.columns else pd.Series(False, index=df.index)
+        has_wind = df["wind_mph"].notna() if "wind_mph" in df.columns else pd.Series(False, index=df.index)
+        conf_base = (has_temp.astype(float) + has_hum.astype(float) + has_wind.astype(float)) / 3.0
+        conf_roof = np.where(roof_closed, 0.35, 1.0)
+        confidence = np.clip(conf_base * conf_roof, 0.0, 1.0)
+        alpha = 0.5 + 0.5 * confidence
+        df["final_multiplier"] = (1.0 + alpha * (df["final_multiplier_raw"].values - 1.0)).astype(np.float32)
+        return df
 
-    # ---------- Build TODAY overlay columns (vectorized, non-cached) ----------
-    debug_mem("Before overlay TODAY", today_df)
-    today_df = compute_overlay_cols_vectorized(today_df)
-    today_df = today_df.copy()  # defragment
-    debug_mem("After overlay TODAY", today_df)
+    event_aligned = compute_overlay_cols(event_aligned)
 
-    # ========== Train/Validation via Embargoed Time Splits ==========
+    # ---------- Train/Validation via Embargoed Time Splits ----------
     seeds = [42, 101, 202, 404]
     P_xgb_oof = np.zeros(len(y), dtype=np.float32)
     P_lgb_oof = np.zeros(len(y), dtype=np.float32)
     P_cat_oof = np.zeros(len(y), dtype=np.float32)
     P_xgb_today, P_lgb_today, P_cat_today = [], [], []
 
-    # ==================== 🔒 Freeze feature schema + TT-Aug aligned ====================
+    # === TT-Aug std vector aligned to X_today ===
+    feat_std_train = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)
+    feat_std_vec = feat_std_train.reindex(X_today.columns)
+    fill_val = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
+    feat_std_vec = np.maximum(1e-6, feat_std_vec.fillna(fill_val).to_numpy(dtype=np.float32))
 
-    # 1) Freeze the exact training column order
-    TRAIN_COLS = X.columns.tolist()
-
-    # 2) Build a prediction-aligned copy of today's matrix
-    X_today_pred = (
-        X_today.reindex(columns=TRAIN_COLS, fill_value=-1)
-               .astype(np.float32)
-    )
-
-    # Safety: identical feature count?
-    if X.shape[1] != X_today_pred.shape[1]:
-        st.error(f"Feature mismatch: train has {X.shape[1]} cols, today(aligned) has {X_today_pred.shape[1]} cols.")
-        st.stop()
-
-    # 3) TT-Aug std vector aligned to TRAIN_COLS
-    feat_std_train = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)   # std from train
-    feat_std_vec = feat_std_train.reindex(TRAIN_COLS)
-    _fill = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
-    feat_std_vec = np.maximum(1e-6, feat_std_vec.fillna(_fill).to_numpy(dtype=np.float32))  # shape (n_features,)
-
-    def tt_aug_preds(clf, Xtd_df, B=3, noise_scale=0.003, kind="proba"):
-        """
-        Stochastic test-time ensembling with per-feature noise aligned to TRAIN_COLS.
-        Pass DataFrame with TRAIN_COLS in order (we'll send X_today_pred).
-        """
-    # Ensure we operate on a matrix with exact TRAIN_COLS order
-        if isinstance(Xtd_df, pd.DataFrame):
-            if list(Xtd_df.columns) != TRAIN_COLS:
-                Xtd_df = Xtd_df.reindex(columns=TRAIN_COLS, fill_value=-1)
-            Xtd_mat = Xtd_df.to_numpy(dtype=np.float32)
+    def tt_aug_preds(clf, Xtd, B=3, noise_scale=0.003, kind="proba"):
+        if isinstance(Xtd, pd.DataFrame):
+            Xtd_mat = Xtd.to_numpy(dtype=np.float32)
         else:
-    # If ndarray given, assume already aligned
-            Xtd_mat = np.asarray(Xtd_df, dtype=np.float32)
-
-    # Rebuild std vector if shapes drift (shouldn't happen, but safe)
-        if feat_std_vec.shape[0] != Xtd_mat.shape[1]:
-            _vec = feat_std_train.reindex(TRAIN_COLS)
-            _fill2 = float(np.nanmedian(feat_std_train.values)) if np.isfinite(np.nanmedian(feat_std_train.values)) else 1e-3
-            vec = np.maximum(1e-6, _vec.fillna(_fill2).to_numpy(dtype=np.float32))
-        else:
-            vec = feat_std_vec
+            Xtd_mat = np.asarray(Xtd, dtype=np.float32)
 
         preds = []
         for _ in range(B):
             noise = np.random.normal(0.0, noise_scale, size=Xtd_mat.shape).astype(np.float32)
-            noise *= vec[np.newaxis, :]  # broadcast per-feature
+            noise *= feat_std_vec[np.newaxis, :]
             Xn = Xtd_mat + noise
             if kind == "ranker":
                 preds.append(clf.predict(Xn))
@@ -729,14 +640,8 @@ if event_file is not None and today_file is not None:
                 if hasattr(clf, "predict_proba"):
                     preds.append(clf.predict_proba(Xn)[:, 1])
                 else:
-                    from scipy.special import expit
                     preds.append(expit(clf.predict(Xn)).astype(np.float32))
         return np.mean(preds, axis=0)
-
-    # 4) Rebind to keep existing code unchanged: all downstream model calls that use `X_today`
-    #    will now receive the prediction-aligned matrix.
-    X_today = X_today_pred
-    # ================================================================================
 
     fold_times = []
     for fold, (tr_idx, va_idx) in enumerate(folds):
@@ -778,7 +683,6 @@ if event_file is not None and today_file is not None:
             preds_lgb_va.append(lgb_clf.predict_proba(X_va)[:,1])
             preds_cat_va.append(cat_clf.predict_proba(X_va)[:,1])
 
-            # TT-Aug for today predictions
             preds_xgb_td.append(tt_aug_preds(xgb_clf, X_today, B=3, noise_scale=0.003))
             preds_lgb_td.append(tt_aug_preds(lgb_clf, X_today, B=3, noise_scale=0.003))
             preds_cat_td.append(tt_aug_preds(cat_clf, X_today, B=3, noise_scale=0.003))
@@ -820,7 +724,6 @@ if event_file is not None and today_file is not None:
         rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
         ranker_oof[va_idx] = rk.predict(X_va)
-        # TT-Aug on ranker for today
         ranker_today_parts.append(tt_aug_preds(rk, X_today, B=3, noise_scale=0.003, kind="ranker"))
 
     ranker_today = np.mean(ranker_today_parts, axis=0)
@@ -839,7 +742,7 @@ if event_file is not None and today_file is not None:
     ]).astype(np.float32)
     P_today_meta = meta.predict_proba(scaler_meta.transform(P_today_base))[:,1]
 
-    # ---------- Calibration (Isotonic on OOF meta) + Adaptive K temperature ----------
+    # ---------- Calibration (Isotonic + Adaptive-K Temp) ----------
     st.markdown("### 📊 Calibration (Isotonic + Adaptive-K Temp)")
     oof_pred_meta = meta.predict_proba(X_meta_s)[:,1]
     auc_oof = roc_auc_score(y, oof_pred_meta)
@@ -850,25 +753,23 @@ if event_file is not None and today_file is not None:
     y_oof_iso = ir.fit_transform(oof_pred_meta, y.values)
     today_iso = ir.transform(P_today_meta)
 
-    # Adaptive K based on slate size
     K_adapt = choose_adaptive_K(len(y))
     best_T, K_used, hits_at_K = tune_temperature_for_topk_adaptive(y_oof_iso, y.values, K=K_adapt)
     st.write(f"Adaptive K used: {K_used} | Best T: {best_T:.3f} | OOF Hits@K: {hits_at_K}")
     logits_today = logit(np.clip(today_iso, 1e-6, 1-1e-6))
     today_iso_t = expit(logits_today * best_T)
 
-    # ---------- Park/hand Bayesian prior blend into p_base ----------
+    # ---------- Park/hand Bayesian prior blend ----------
     prior_today = X_today.get("te_park_hand", pd.Series(y.mean(), index=pd.RangeIndex(len(X_today)))).astype(float).values
     beta_prior = 0.06
     p_base_cal = (1.0 - beta_prior) * today_iso_t + beta_prior * prior_today
 
-    # Also prepare OOF p_base with same prior for micro weight retune
     prior_oof = X.get("te_park_hand", pd.Series(y.mean(), index=pd.RangeIndex(len(X)))).astype(float).values
     logits_oof = logit(np.clip(y_oof_iso, 1e-6, 1-1e-6))
     y_oof_iso_t = expit(logits_oof * best_T)
     p_oof_cal = (1.0 - beta_prior) * y_oof_iso_t + beta_prior * prior_oof
 
-    # ---------- Handedness-segmented small models (blend into base preds) ----------
+    # ---------- Handedness-segmented small models ----------
     def segment_indices(df_ref):
         hand = df_ref.get("batter_hand", df_ref.get("stand", pd.Series("R", index=df_ref.index))).astype(str).str.upper().fillna("R")
         seg_R = hand != "L"
@@ -880,7 +781,7 @@ if event_file is not None and today_file is not None:
 
     def train_segmented_preds(mask_tr, mask_td):
         idx = np.where(mask_tr)[0]
-        if len(idx) < 200:
+        if len(idx) < 200:  # too small
             return None, None, None
         X_loc = X.iloc[idx]; y_loc = y.iloc[idx]
         P_oof = np.zeros(len(y_loc), dtype=np.float32)
@@ -908,8 +809,8 @@ if event_file is not None and today_file is not None:
         P_td = np.mean(P_td_parts, axis=0) if P_td_parts else None
         return P_oof, P_td, len(idx)
 
-    P_segL_oof, P_segL_td, nL = train_segmented_preds(segL_idx, segL_today)
-    P_segR_oof, P_segR_td, nR = train_segmented_preds(segR_idx, segR_today)
+    P_segL_oof, P_segL_td, _ = train_segmented_preds(segL_idx, segL_today)
+    P_segR_oof, P_segR_td, _ = train_segmented_preds(segR_idx, segR_today)
 
     P_today_meta_seg = P_today_meta.copy()
     if P_segL_td is not None:
@@ -917,8 +818,10 @@ if event_file is not None and today_file is not None:
     if P_segR_td is not None:
         P_today_meta_seg[segR_today] = 0.5*P_today_meta_seg[segR_today] + 0.5*np.asarray(P_segR_td)
 
-    # Replace calibrated base with segmented-augmented calibrated+prior
     p_base = (1.0 - beta_prior) * expit(logit(np.clip(P_today_meta_seg, 1e-6, 1-1e-6)) * best_T) + beta_prior * prior_today
+
+    # ---------- TODAY overlay columns ----------
+    today_df = compute_overlay_cols(today_df)
 
     # ---------- OOF helpers for micro weight retune ----------
     def _rank_desc(x):
@@ -986,7 +889,7 @@ if event_file is not None and today_file is not None:
                   + 0.15 * np.log(today_df["final_multiplier"].values + 1e-9))
     prob_rbi = expit(logits_rbi)
 
-    # ---------- Micro retune of w_prob / w_ranker on OOF ----------
+    # ---------- Micro retune of w_prob / w_ranker ----------
     base_W = DEFAULT_WEIGHTS.copy()
     grid = [0.85, 1.0, 1.15]
     best_loss, best_W = 1e9, base_W.copy()
@@ -1033,8 +936,8 @@ if event_file is not None and today_file is not None:
             if lbr is None and "models" in bundle:
                 models = bundle["models"]
                 lbr = models.get("lgb") or next((m for m in models.values() if m is not None), None)
-
             expected_feats = [str(f) for f in bundle.get("features", [])]
+
             can_build = all(f in feat_map_today for f in expected_feats)
             n_expected = len(expected_feats)
             if hasattr(lbr, "n_features_in_"): can_build = can_build and (lbr.n_features_in_ == n_expected)
@@ -1062,7 +965,7 @@ if event_file is not None and today_file is not None:
         except Exception as e:
             st.warning(f"Could not load/apply learning ranker (fail-closed): {e}")
 
-    # ---------- Final blended score using *retuned* weights ----------
+    # ---------- Final blended score ----------
     log_overlay = np.log(today_df["final_multiplier"].values + 1e-9)
     W = best_W
     ranked_score = expit(
@@ -1073,7 +976,7 @@ if event_file is not None and today_file is not None:
       - W["w_penalty"] * dis_penalty
     )
 
-    # ================= Leaderboard Build & Outputs (with tie-breaking) =================
+    # ================= Leaderboard Build & Outputs =================
     def build_leaderboard(df, calibrated_probs, final_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"):
         df = df.copy()
         df[label] = np.asarray(calibrated_probs)
@@ -1081,7 +984,6 @@ if event_file is not None and today_file is not None:
         df["prob_2tb"] = np.asarray(prob_2tb)
         df["prob_rbi"] = np.asarray(prob_rbi)
 
-        # Tie-breaking: ranked_probability ↓, then prob_2tb ↓, then prob_rbi ↓
         df = df.sort_values(by=["ranked_probability","prob_2tb","prob_rbi"], ascending=[False, False, False]).reset_index(drop=True)
         df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
 
@@ -1093,8 +995,7 @@ if event_file is not None and today_file is not None:
         if mlb_id_col: cols.append(mlb_id_col)
         for c in ["player_name", "team_code", "time"]:
             if c in df.columns: cols.append(c)
-
-        cols += [
+    cols += [
             label, "ranked_probability",
             "prob_2tb", "prob_rbi",
             "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
@@ -1102,27 +1003,32 @@ if event_file is not None and today_file is not None:
             "temp", "temp_rating", "humidity", "humidity_rating",
             "wind_mph", "wind_rating", "wind_dir_string",
             "condition", "condition_rating",
-            "rrf_aux","model_disagreement",
+            # diagnostics
+            "rrf_aux", "model_disagreement",
             "hr_outcome",
         ]
         cols = [c for c in cols if c in df.columns]
         out = df[cols].copy()
 
+        # rounding for readability
         for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
-            if c in out.columns:
+            if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
                 out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
-        for c in ["overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-                  "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"]:
-            if c in out.columns:
+        for c in [
+            "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+            "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
+        ]:
+            if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
                 out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
         return out
 
+    # Attach diagnostics
     today_df["rrf_aux"] = rrf
     today_df["model_disagreement"] = disagree_std
 
     leaderboard = build_leaderboard(today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T")
 
-    # ===== Render current-day leaderboard (no charts) =====
+    # ===== Render Leaderboard =====
     top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
     st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
     leaderboard_top = leaderboard.head(int(top_n))
@@ -1141,17 +1047,19 @@ if event_file is not None and today_file is not None:
         mime="text/csv",
     )
 
-    # Drift diagnostics
+    # Drift diagnostics (safe, no plots)
     try:
         def drift_check(train, today, n=6):
             drifted = []
             for c in train.columns:
-                if c not in today.columns: continue
+                if c not in today.columns:
+                    continue
                 tmean = np.nanmean(train[c]); tstd = np.nanstd(train[c])
                 dmean = np.nanmean(today[c])
                 if tstd > 0 and abs(tmean - dmean) / tstd > n:
                     drifted.append(c)
             return drifted
+
         drifted = drift_check(X, X_today, n=6)
         if drifted:
             st.markdown("#### ⚡ **Feature Drift Diagnostics**")
@@ -1161,4 +1069,7 @@ if event_file is not None and today_file is not None:
 
     gc.collect()
     st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-    st.caption("Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control + learner (fail-closed). 2+TB and RBI proxies included with tie-breaking.")
+    st.caption(
+        "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
+        "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
+    )
