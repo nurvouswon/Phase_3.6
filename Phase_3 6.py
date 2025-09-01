@@ -1011,16 +1011,16 @@ if event_file is not None and today_file is not None:
     out = df[cols].copy()
 
         # rounding for readability
-        for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
-            if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
-                out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
-        for c in [
-            "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-            "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
-        ]:
-            if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
-                out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
-        return out
+    for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
+        if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
+    for c in [
+        "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+        "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
+    ]:
+        if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
+    return out
 
     # Attach diagnostics
     today_df["rrf_aux"] = rrf
