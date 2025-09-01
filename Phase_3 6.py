@@ -1020,7 +1020,7 @@ if event_file is not None and today_file is not None:
     ]:
         if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
             out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
-        return out
+    return out
 
     # Attach diagnostics
     today_df["rrf_aux"] = rrf
