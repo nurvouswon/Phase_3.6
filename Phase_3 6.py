@@ -452,42 +452,59 @@ def short_term_hot_factor_vectorized(df):
     factor *= np.where(br>=0.12, 1.05, np.where(br>=0.08, 1.02, 1.0))
     return np.clip(factor, 0.96, 1.10).astype(np.float32)
 
-def compute_overlay_cols_vectorized(df):
+def compute_overlay_cols_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    ratings = rate_weather_vectorized(df)
-    overlay = overlay_multiplier_vectorized(df)
-    weak_p  = weak_pitcher_factor_vectorized(df)
-    hot_b   = short_term_hot_factor_vectorized(df)
 
-    df["overlay_multiplier"] = overlay
-    df["weak_pitcher_factor"] = weak_p
-    df["hot_streak_factor"] = hot_b
+    # --- ratings (expects a DataFrame aligned to df.index) ---
+    ratings = rate_weather_vectorized(df)  # must return columns like temp_rating, humidity_rating, etc.
 
+    # --- overlay components (vectorized helpers should return 1-D arrays/Series length == len(df)) ---
+    overlay = overlay_multiplier_vectorized(df).astype(np.float32)
+    weak_p  = weak_pitcher_factor_vectorized(df).astype(np.float32)
+    hot_b   = short_term_hot_factor_vectorized(df).astype(np.float32)
+
+    # ensure 1-D numpy arrays
+    overlay = np.asarray(overlay, dtype=np.float32).reshape(-1)
+    weak_p  = np.asarray(weak_p,  dtype=np.float32).reshape(-1)
+    hot_b   = np.asarray(hot_b,   dtype=np.float32).reshape(-1)
+
+    # raw multiplier with caps
     final_raw = np.clip(
-        overlay.astype(float).clip(0.68, 1.44)
-        * weak_p.astype(float)
-        * hot_b.astype(float),
+        np.clip(overlay, 0.68, 1.44) *
+        np.clip(weak_p,  0.90, 1.18) *
+        np.clip(hot_b,   0.96, 1.10),
         0.60, 1.65
     ).astype(np.float32)
-    df["final_multiplier_raw"] = final_raw
 
-    # uncertainty-aware shrink
-    roof = _strs(df, "roof_status").str.lower()
+    # --- uncertainty-aware shrinkage ---
+    roof = df.get("roof_status", pd.Series("", index=df.index)).astype(str).str.lower()
     roof_closed = roof.str.contains("closed|indoor|domed", regex=True)
-    has_temp = df["temp"].notna() if "temp" in df.columns else pd.Series(False, index=df.index)
-    has_hum  = df["humidity"].notna() if "humidity" in df.columns else pd.Series(False, index=df.index)
-    has_wind = df["wind_mph"].notna() if "wind_mph" in df.columns else pd.Series(False, index=df.index)
+
+    has_temp = df["temp"].notna()      if "temp"      in df.columns else pd.Series(False, index=df.index)
+    has_hum  = df["humidity"].notna()  if "humidity"  in df.columns else pd.Series(False, index=df.index)
+    has_wind = df["wind_mph"].notna()  if "wind_mph"  in df.columns else pd.Series(False, index=df.index)
+
     conf_base = (has_temp.astype(float) + has_hum.astype(float) + has_wind.astype(float)) / 3.0
-    conf_roof = np.where(roof_closed, 0.35, 1.0)
-    confidence = np.clip(conf_base * conf_roof, 0.0, 1.0)
-    alpha = 0.5 + 0.5 * confidence
-    df["final_multiplier"] = (1.0 + alpha * (final_raw.values - 1.0)).astype(np.float32)
+    conf_roof = np.where(roof_closed.to_numpy(), 0.35, 1.0)
 
-    # attach ratings last via concat to avoid fragmentation
-    df = pd.concat([df, ratings], axis=1)
-    df = df.copy()  # defragment
-    return df
+    confidence = np.clip(conf_base.to_numpy(dtype=np.float32) * conf_roof, 0.0, 1.0)
+    alpha = 0.5 + 0.5 * confidence  # shape (n,)
 
+    final_mult = (1.0 + alpha * (final_raw - 1.0)).astype(np.float32)
+
+    # assemble all new cols in one shot to avoid fragmentation
+    new_cols = pd.DataFrame({
+        "overlay_multiplier": overlay,
+        "weak_pitcher_factor": weak_p,
+        "hot_streak_factor": hot_b,
+        "final_multiplier_raw": final_raw,
+        "final_multiplier": final_mult,
+    }, index=df.index)
+
+    if isinstance(ratings, pd.DataFrame):
+        new_cols = pd.concat([new_cols, ratings], axis=1)
+
+    return pd.concat([df, new_cols], axis=1)
 # ===================== APP START =====================
 
 # Optional learning ranker upload (fail-closed parity check)
