@@ -1024,56 +1024,54 @@ if event_file is not None and today_file is not None:
 
     return out
 
-    # Attach diagnostics
-    today_df["rrf_aux"] = rrf
-    today_df["model_disagreement"] = disagree_std
+# Attach diagnostics
+today_df["rrf_aux"] = rrf
+today_df["model_disagreement"] = disagree_std
 
-    leaderboard = build_leaderboard(
-        today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"
-    )
+leaderboard = build_leaderboard(today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T")
 
-    # ===== Render Leaderboard =====
-    top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
-    st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
-    leaderboard_top = leaderboard.head(int(top_n))
-    st.dataframe(leaderboard_top, use_container_width=True)
+# ===== Render Leaderboard =====
+top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
+st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
+leaderboard_top = leaderboard.head(int(top_n))
+st.dataframe(leaderboard_top, use_container_width=True)
 
-    st.download_button(
-        label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
-        data=leaderboard_top.to_csv(index=False),
-        file_name=f"top{int(top_n)}_leaderboard_blended.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        label="⬇️ Download Full Prediction CSV (Blended)",
-        data=leaderboard.to_csv(index=False),
-        file_name="today_hr_predictions_full_blended.csv",
-        mime="text/csv",
-    )
+st.download_button(
+    label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
+    data=leaderboard_top.to_csv(index=False),
+    file_name=f"top{int(top_n)}_leaderboard_blended.csv",
+    mime="text/csv",
+)
+st.download_button(
+    label="⬇️ Download Full Prediction CSV (Blended)",
+    data=leaderboard.to_csv(index=False),
+    file_name="today_hr_predictions_full_blended.csv",
+    mime="text/csv",
+)
 
-    # Drift diagnostics (safe, no plots)
-    try:
-        def drift_check(train, today, n=6):
-            drifted = []
-            for c in train.columns:
-                if c not in today.columns:
-                    continue
-                tmean = np.nanmean(train[c]); tstd = np.nanstd(train[c])
-                dmean = np.nanmean(today[c])
-                if tstd > 0 and abs(tmean - dmean) / tstd > n:
-                    drifted.append(c)
-            return drifted
+# Drift diagnostics (safe, no plots)
+try:
+    def drift_check(train, today, n=6):
+        drifted = []
+        for c in train.columns:
+            if c not in today.columns:
+                continue
+            tmean = np.nanmean(train[c]); tstd = np.nanstd(train[c])
+            dmean = np.nanmean(today[c])
+            if tstd > 0 and abs(tmean - dmean) / tstd > n:
+                drifted.append(c)
+        return drifted
 
-        drifted = drift_check(X, X_today, n=6)
-        if drifted:
-            st.markdown("#### ⚡ **Feature Drift Diagnostics**")
-            st.write("These features show unusual mean/std changes:", drifted)
-    except Exception:
-        pass
+    drifted = drift_check(X, X_today, n=6)
+    if drifted:
+        st.markdown("#### ⚡ **Feature Drift Diagnostics**")
+        st.write("These features show unusual mean/std changes:", drifted)
+except Exception:
+    pass
 
-    gc.collect()
-    st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-    st.caption(
-        "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
-        "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
+gc.collect()
+st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
+st.caption(
+    "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
+    "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
 )
