@@ -1007,26 +1007,30 @@ if event_file is not None and today_file is not None:
             "rrf_aux", "model_disagreement",
             "hr_outcome",
         ]
-    cols = [c for c in cols if c in df.columns]
-    out = df[cols].copy()
+        cols = [c for c in cols if c in df.columns]
+        out = df[cols].copy()
 
-        # rounding for readability
-    for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
-        if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
-            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
-    for c in [
-        "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-        "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
-    ]:
-        if c in out.columns and isinstance(out[c], (pd.Series, np.ndarray, list)):
-            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
-    return out
+        # rounding for readability (guard against non-Series/objects)
+        for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
+            if c in out.columns and isinstance(out[c], pd.Series):
+                out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(4)
+
+        for c in [
+            "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+            "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
+        ]:
+            if c in out.columns and isinstance(out[c], pd.Series):
+                out[c] = pd.to_numeric(out[c], errors="coerce").astype(float).round(3)
+
+        return out
 
     # Attach diagnostics
     today_df["rrf_aux"] = rrf
     today_df["model_disagreement"] = disagree_std
 
-    leaderboard = build_leaderboard(today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T")
+    leaderboard = build_leaderboard(
+        today_df, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"
+    )
 
     # ===== Render Leaderboard =====
     top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
@@ -1072,4 +1076,4 @@ if event_file is not None and today_file is not None:
     st.caption(
         "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
         "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
-    )
+)
