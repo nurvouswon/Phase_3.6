@@ -1007,7 +1007,7 @@ if event_file is not None and today_file is not None:
             "rrf_aux", "model_disagreement",
             "hr_outcome",
         ]
-        cols = [c for c in cols if c in df.columns]
+    cols = [c for c in cols if c in df.columns]
         out = df[cols].copy()
 
         # rounding for readability
