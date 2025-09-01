@@ -1008,7 +1008,7 @@ if event_file is not None and today_file is not None:
             "hr_outcome",
         ]
     cols = [c for c in cols if c in df.columns]
-        out = df[cols].copy()
+    out = df[cols].copy()
 
         # rounding for readability
         for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
