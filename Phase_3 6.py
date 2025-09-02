@@ -660,7 +660,18 @@ if event_file is not None and today_file is not None:
 
     # ========== Train/Validation via Embargoed Time Splits ==========
     seeds = [42, 101, 202, 404]
+    # --- HARD ALIGN today's feature matrix to the training columns (order + exact set) ---
+    extra_cols   = [c for c in X_today.columns if c not in X.columns]
+    missing_cols = [c for c in X.columns if c not in X_today.columns]
+    if extra_cols or missing_cols:
+        st.warning({
+            "note": "Aligning X_today to training feature set",
+            "extra_cols_in_today_dropped": extra_cols,
+            "missing_cols_in_today_filled_with_-1": missing_cols
+        })
 
+    # Reindex enforces exact column set and order to match the model’s expectation
+    X_today = X_today.reindex(columns=X.columns, fill_value=-1).astype(np.float32)
     # === TT-Aug std vector aligned to X_today ===
     feat_std_train = pd.Series(np.asarray(X.std(axis=0), dtype=float), index=X.columns)
     feat_std_vec = feat_std_train.reindex(X_today.columns)
