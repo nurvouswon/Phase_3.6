@@ -883,7 +883,57 @@ if event_file is not None and today_file is not None:
         logits_oof = logit(np.clip(y_oof_iso, 1e-6, 1-1e-6))
         y_oof_iso_t = expit(logits_oof * best_T)
         p_oof_cal = (1.0 - beta_prior) * y_oof_iso_t + beta_prior * prior_oof
+    # --- Guard & diagnostics right after prior-blend, before segmented models ---
+    with time_block("Ensure TODAY overlays (vectorized) + diagnostics"):
+        try:
+            # 1) Ensure vectorized TODAY overlays are present before they are used anywhere
+            need_overlay = ("final_multiplier" not in today_df.columns) or \
+                           ("overlay_multiplier" not in today_df.columns) or \
+                           ("final_multiplier_raw" not in today_df.columns)
+            if need_overlay:
+                st.write({"overlay_today": "building_vectorized"})
+                today_df = compute_overlay_cols_vectorized(today_df)
+                today_df = today_df.copy()  # de-fragment
 
+            # 2) Sanity on shapes / NaNs
+            st.write({
+                "post_overlay_today_shape": today_df.shape,
+                "X_today_shape_check": X_today.shape,
+                "has_final_multiplier": "final_multiplier" in today_df.columns,
+                "has_overlay_multiplier": "overlay_multiplier" in today_df.columns
+            })
+
+            if len(today_df) != len(X_today):
+                st.error(f"Row mismatch: today_df({len(today_df)}) vs X_today({len(X_today)})")
+                st.stop()
+
+            for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
+                if c in today_df.columns:
+                    n_nan = pd.to_numeric(today_df[c], errors="coerce").isna().sum()
+                    if n_nan:
+                        st.warning({f"NaNs in {c}": int(n_nan)})
+
+            for c in ["overlay_multiplier", "final_multiplier_raw", "final_multiplier"]:
+                if c in today_df.columns:
+                    today_df[c] = pd.to_numeric(today_df[c], errors="coerce").astype(np.float32)
+
+            try:
+                fm = today_df["final_multiplier"].to_numpy(dtype=float)
+                st.write({
+                    "final_multiplier_min": float(np.nanmin(fm)),
+                    "final_multiplier_max": float(np.nanmax(fm)),
+                    "final_multiplier_mean": float(np.nanmean(fm))
+                })
+            except Exception:
+                pass
+
+            if "te_park_hand" in X_today.columns:
+                ph = X_today["te_park_hand"].to_numpy(dtype=float)
+                if ph.shape[0] != len(today_df):
+                    st.warning("te_park_hand length mismatch vs today_df (safe but FYI).")
+        except Exception as e:
+            st.exception(e)
+            st.stop()
     # ---------- Handedness-segmented small models (blend into base preds) ----------
     with time_block("Segmented models (L/R)"):
         def segment_indices(df_ref):
