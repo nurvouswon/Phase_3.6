@@ -395,8 +395,8 @@ def weak_pitcher_factor_vectorized(df):
     with np.errstate(invalid='ignore', divide='ignore'):
         hr_rate_short = hr3 / pa3
     ss_shrink = np.minimum(1.0, np.nan_to_num(pa3, nan=0.0) / 30.0)
-    cond_hi  = (hr_rate_short >= 0.10) & (pa3 > 0)
-    cond_mid = (hr_rate_short >= 0.07) & (hr_rate_short < 0.10) & (pa3 > 0)
+    cond_hi  = ((hr_rate_short >= 0.10) & (pa3 > 0)).fillna(False).to_numpy()
+    cond_mid = ((hr_rate_short >= 0.07) & (hr_rate_short < 0.10) & (pa3 > 0)).fillna(False).to_numpy()
     # pd.NA can appear in boolean dtype; force to plain NumPy bool with NA->False
     cond_hi  = pd.Series(cond_hi, index=df.index).fillna(False).to_numpy(dtype=bool)
     cond_mid = pd.Series(cond_mid, index=df.index).fillna(False).to_numpy(dtype=bool)
