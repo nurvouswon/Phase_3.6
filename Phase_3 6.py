@@ -1053,7 +1053,86 @@ if event_file is not None and today_file is not None:
         p_base = (1.0 - beta_prior) * expit(logits_today_seg * best_T) + beta_prior * prior_today
         st.write({"p_base_shape": p_base.shape})
 
-    # ---------- Build TODAY overlay columns (vectorized) ----------
+    # ---------- Build TODAY overlay columns ----------
+            # Ensure today's inputs are deduplicated, typed, and 1-D before vectorized helpers
+            def _dedup_inplace(df):
+                dup = df.columns[df.columns.duplicated()].tolist()
+                if dup:
+                    st.warning({"duplicate_columns_in_today_df": dup})
+                    for name in pd.unique(dup):
+                        sub = df.loc[:, df.columns == name]
+                        # consolidate duplicates to a single numeric/str series by preferring right-most non-null
+                        if sub.shape[1] > 1:
+                            # try numeric first; if not numeric, do string consolidation
+                            try:
+                                sub_num = sub.apply(pd.to_numeric, errors="coerce")
+                                single = sub_num.ffill(axis=1).iloc[:, -1]
+                            except Exception:
+                                sub_str = sub.astype(str)
+                                single = sub_str.ffill(axis=1).iloc[:, -1]
+                            df.drop(columns=list(sub.columns[1:]), inplace=True, errors="ignore")
+                            df[name] = single
+
+            def _coerce_numeric_inplace(df, cols):
+                for c in cols:
+                    if c in df.columns:
+                        # if a DataFrame snuck in from dup names, flatten it
+                        if isinstance(df[c], pd.DataFrame):
+                            df[c] = df[c].ffill(axis=1).iloc[:, -1]
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            def ensure_today_vectorized_inputs(df):
+                df = df.copy()
+
+                # 1) collapse duplicate columns first
+                _dedup_inplace(df)
+
+                # 2) coerce expected string cols to str (handles DataFrame dup case too)
+                str_cols = [
+                    "roof_status", "wind_dir_string", "batter_hand", "stand",
+                    "pitcher_hand", "p_throws", "condition", "park"
+                ]
+                for c in str_cols:
+                    if c in df.columns:
+                        if isinstance(df[c], pd.DataFrame):
+                            df[c] = df[c].astype(str).ffill(axis=1).iloc[:, -1]
+                        df[c] = df[c].astype(str)
+
+                # 3) coerce all overlay-used numeric columns to numeric
+                num_cols = [
+                    "temp","humidity","wind_mph","park_altitude","park_hr_rate",
+                    "park_hr_pct_rhb","park_hr_pct_lhb",
+                    "b_pull_rate_7","b_pull_rate_14","b_fb_rate_7","b_fb_rate_14",
+                    "b_barrel_rate_7","b_barrel_rate_14","b_hr_per_pa_7","b_hr_per_pa_5",
+                    "p_fb_rate_14","p_fb_rate_7",
+                    "p_rolling_hr_3","p_hr_count_3","p_rolling_pa_3",
+                    "p_fs_barrel_rate_14","p_barrel_rate_14","p_hard_hit_rate_14",
+                    "p_fs_barrel_rate_30","p_barrel_rate_30","p_hard_hit_rate_30",
+                    "p_gb_rate_14","p_gb_rate_7","p_gb_rate","p_gb_pct",
+                    "p_fb_rate","p_fb_pct",
+                    "p_bb_rate_14","p_bb_rate_30","p_bb_rate",
+                    "p_xwoba_con_14","p_xwoba_con_30","p_xwoba_con",
+                    "p_avg_exit_velo_14","p_avg_exit_velo_7","p_avg_exit_velo_30",
+                    "p_exit_velocity_avg","p_avg_exit_velo",
+                    "b_avg_exit_velo_5","b_avg_exit_velo_3",
+                    "b_la_mean_5","b_la_mean_3",
+                    "b_barrel_rate_5","b_barrel_rate_3",
+                ]
+                _coerce_numeric_inplace(df, [c for c in num_cols if c in df.columns])
+
+                return df
+
+            # run the guard once before vectorized overlay
+            today_df = ensure_today_vectorized_inputs(today_df)
+
+            # (keep your existing line)
+            today_df = compute_overlay_cols_vectorized(today_df)
+
+            # quick sanity after overlay
+            st.write({
+                "post_overlay_today_shape": today_df.shape,
+                "dup_cols_after_overlay": int(today_df.columns.duplicated().sum())
+            })
     with time_block("Compute TODAY overlays (vectorized)"):
         try:
             today_df = compute_overlay_cols_vectorized(today_df)
