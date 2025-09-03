@@ -914,7 +914,34 @@ if event_file is not None and today_file is not None:
             dup_cols = today_df.columns[today_df.columns.duplicated()].tolist()
             if dup_cols:
                 st.warning({"duplicate_columns_in_today_df": dup_cols})
+            # If there are duplicate columns, collapse each duplicated name into a single numeric Series.
+            if dup_cols:
+                # Work on unique duplicated names only
+                for name in pd.unique(dup_cols):
+                    sub = today_df.loc[:, today_df.columns == name]
+                    # Coerce all dups to numeric (errors -> NaN)
+                    sub_num = sub.apply(pd.to_numeric, errors="coerce")
+                    # Prefer the right-most (newest) non-null value per row
+                    single = sub_num.ffill(axis=1).iloc[:, -1]
+                    # Drop all duplicate columns except the first occurrence
+                    cols_to_drop = list(sub.columns[1:])  # keep the first, drop the rest
+                    if cols_to_drop:
+                        today_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+                    # Overwrite the kept column with the consolidated numeric values
+                    today_df[name] = single.astype(np.float32)
 
+            # Now it’s safe to run the NaN check on single columns
+            for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
+                if c in today_df.columns:
+                    val = today_df[c]
+                    if isinstance(val, pd.DataFrame):
+                        # Safety: in case something else reintroduced duplicates
+                        val = val.ffill(axis=1).iloc[:, -1]
+                    elif not isinstance(val, (pd.Series, np.ndarray, list, tuple)):
+                        val = pd.Series(val, index=today_df.index)
+                    n_nan = pd.to_numeric(val, errors="coerce").isna().sum()
+                    if n_nan:
+                        st.warning({f"NaNs in {c}": int(n_nan)})
             for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
                 if c in today_df.columns:
                     val = today_df[c]
