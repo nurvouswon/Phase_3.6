@@ -19,6 +19,7 @@
 # - Added detailed timing/memory diagnostics around training, OOF, and TT-Aug
 # - Added strict feature-count check in tt_aug_preds for early failure signal
 # - Use vectorized overlay for TODAY (faster, consistent with TRAIN)
+# - Robust duplicate-column and non-1D handling for TODAY overlay columns
 # ============================================================
 
 import streamlit as st
@@ -89,7 +90,7 @@ def safe_read_cached(path):
     except UnicodeDecodeError:
         return pd.read_csv(path, encoding='latin1', low_memory=False)
 
-def dedup_columns(df): 
+def dedup_columns(df):
     return df.loc[:, ~df.columns.duplicated()]
 
 def find_duplicate_columns(df):
@@ -100,32 +101,38 @@ def fix_types(df):
         if df[col].isnull().all():
             continue
         if df[col].dtype == 'O':
-            try: df[col] = pd.to_numeric(df[col], errors='ignore')
-            except: pass
+            try:
+                df[col] = pd.to_numeric(df[col], errors='ignore')
+            except:
+                pass
         if pd.api.types.is_float_dtype(df[col]):
             try:
                 s = df[col].dropna()
                 if len(s) and (s % 1 == 0).all():
                     df[col] = df[col].astype(pd.Int64Dtype())
-            except: pass
+            except:
+                pass
     return df
 
 def clean_X(df, train_cols=None):
-    df = dedup_columns(df); df = fix_types(df)
+    df = dedup_columns(df)
+    df = fix_types(df)
     allowed_obj = {'wind_dir_string','condition','player_name','city','park','roof_status',
                    'team_code','time','batter_hand','pitcher_team_code','pitcher_hand','stand'}
     drop_cols = [c for c in df.select_dtypes('O').columns if c not in allowed_obj]
     df = df.drop(columns=drop_cols, errors='ignore').fillna(-1)
     if train_cols is not None:
         for c in train_cols:
-            if c not in df.columns: df[c] = -1
+            if c not in df.columns:
+                df[c] = -1
         df = df[list(train_cols)]
     return df
 
 def get_valid_feature_cols(df, drop=None):
     base_drop = {'game_date','batter_id','mlb_id','player_name','pitcher_id','city',
                  'park','roof_status','team_code','time'}
-    if drop: base_drop |= set(drop)
+    if drop:
+        base_drop |= set(drop)
     numerics = df.select_dtypes(include=[np.number]).columns
     return [c for c in numerics if c not in base_drop]
 
@@ -135,36 +142,42 @@ def nan_inf_check(X, name):
         nans = X_num.isna().sum().sum()
         infs = np.isinf(X_num.to_numpy(dtype=np.float64, copy=False)).sum()
     else:
-        nans = np.isnan(X).sum(); infs = np.isinf(X).sum()
+        nans = np.isnan(X).sum()
+        infs = np.isinf(X).sum()
     if nans > 0 or infs > 0:
-        st.error(f"Found {nans} NaNs and {infs} Infs in {name}! Please fix."); st.stop()
+        st.error(f"Found {nans} NaNs and {infs} Infs in {name}! Please fix.")
+        st.stop()
 
 def winsorize_clip(X, limits=(0.01, 0.99)):
     X = X.astype(float)
     for col in X.columns:
-        lower = X[col].quantile(limits[0]); upper = X[col].quantile(limits[1])
+        lower = X[col].quantile(limits[0])
+        upper = X[col].quantile(limits[1])
         X[col] = X[col].clip(lower=lower, upper=upper)
     return X
 
 def remove_outliers(X, y, method="iforest", contamination=0.012,
                     n_estimators=150, max_samples='auto', n_neighbors=20, scale=True):
     if scale:
-        scaler = StandardScaler(); X_scaled = scaler.fit_transform(X)
-    else: X_scaled = X
-    if method=="iforest":
-        clf = IsolationForest(contamination=contamination,n_estimators=n_estimators,
-                              max_samples=max_samples,random_state=42)
-        mask = clf.fit_predict(X_scaled)==1
-    elif method=="lof":
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+    else:
+        X_scaled = X
+    if method == "iforest":
+        clf = IsolationForest(contamination=contamination, n_estimators=n_estimators,
+                              max_samples=max_samples, random_state=42)
+        mask = clf.fit_predict(X_scaled) == 1
+    elif method == "lof":
         clf = LocalOutlierFactor(contamination=contamination, n_neighbors=n_neighbors)
-        mask = clf.fit_predict(X_scaled)==1
+        mask = clf.fit_predict(X_scaled) == 1
     else:
         raise ValueError("Unknown method")
     return X[mask], y[mask]
 
 def zscore(a):
     a = np.asarray(a, dtype=np.float64)
-    mu = np.nanmean(a); sd = np.nanstd(a) + 1e-9
+    mu = np.nanmean(a)
+    sd = np.nanstd(a) + 1e-9
     return (a - mu) / sd
 
 def debug_mem(tag, df):
@@ -181,17 +194,21 @@ def oof_target_encode(values, y, dates, folds, global_prior=None, smoothing=50.0
         global_prior = y.mean() if len(y) else 0.0
 
     full_ct = values.value_counts(dropna=False)
-    grp_sum = defaultdict(float); grp_cnt = defaultdict(float)
+    grp_sum = defaultdict(float)
+    grp_cnt = defaultdict(float)
     for v, target in zip(values.fillna("__NA__"), y):
-        grp_sum[v] += target; grp_cnt[v] += 1.0
+        grp_sum[v] += target
+        grp_cnt[v] += 1.0
 
     oof = np.zeros(len(values), dtype=np.float32)
     for tr_idx, va_idx in folds:
         tr_vals = values.iloc[tr_idx].fillna("__NA__")
-        tr_y    = y[tr_idx]
-        sum_d = defaultdict(float); cnt_d = defaultdict(float)
+        tr_y = y[tr_idx]
+        sum_d = defaultdict(float)
+        cnt_d = defaultdict(float)
         for v, t in zip(tr_vals, tr_y):
-            sum_d[v] += t; cnt_d[v] += 1.0
+            sum_d[v] += t
+            cnt_d[v] += 1.0
         te_map = {}
         for v in set(tr_vals):
             c = cnt_d.get(v, 0.0)
@@ -343,8 +360,11 @@ def overlay_multiplier_vectorized(df):
     pulled_field = np.where(hand=="R", "lf", "rf")
     wind_factor = np.ones(len(df), dtype=np.float64)
     valid_wind = (wind>=6) & (wdir!="")
-    out = wdir.str.contains("out"); inn = wdir.str.contains("in")
-    has_lf = wdir.str.contains("lf"); has_rf = wdir.str.contains("rf"); has_cf = wdir.str.contains("cf|center")
+    out = wdir.str.contains("out")
+    inn = wdir.str.contains("in")
+    has_lf = wdir.str.contains("lf")
+    has_rf = wdir.str.contains("rf")
+    has_cf = wdir.str.contains("cf|center")
 
     hi_pull = (~np.isnan(b_pull)) & (b_pull>=0.35)
     lo_pull = (~np.isnan(b_pull)) & (b_pull<=0.28)
@@ -391,35 +411,39 @@ def weak_pitcher_factor_vectorized(df):
         return out
 
     factor = np.ones(len(df), dtype=np.float64)
-    hr3 = pick("p_rolling_hr_3","p_hr_count_3"); pa3 = pick("p_rolling_pa_3")
+
+    hr3 = pick("p_rolling_hr_3", "p_hr_count_3")
+    pa3 = pick("p_rolling_pa_3")
     with np.errstate(invalid='ignore', divide='ignore'):
         hr_rate_short = hr3 / pa3
+
     ss_shrink = np.minimum(1.0, np.nan_to_num(pa3, nan=0.0) / 30.0)
-    cond_hi  = ((hr_rate_short >= 0.10) & (pa3 > 0)).fillna(False).to_numpy()
+
+    cond_hi = ((hr_rate_short >= 0.10) & (pa3 > 0)).fillna(False).to_numpy()
     cond_mid = ((hr_rate_short >= 0.07) & (hr_rate_short < 0.10) & (pa3 > 0)).fillna(False).to_numpy()
-    # pd.NA can appear in boolean dtype; force to plain NumPy bool with NA->False
-    cond_hi  = pd.Series(cond_hi, index=df.index).fillna(False).to_numpy(dtype=bool)
+    cond_hi = pd.Series(cond_hi, index=df.index).fillna(False).to_numpy(dtype=bool)
     cond_mid = pd.Series(cond_mid, index=df.index).fillna(False).to_numpy(dtype=bool)
 
     factor *= np.where(cond_hi, (1.12 * (0.5 + 0.5 * ss_shrink)), 1.0)
     factor *= np.where(cond_mid, (1.06 * (0.5 + 0.5 * ss_shrink)), 1.0)
-    brl14 = pick("p_barrel_rate_14","p_hard_hit_rate_14")
-    brl30 = pick("p_barrel_rate_30","p_hard_hit_rate_30")
+
+    brl14 = pick("p_barrel_rate_14", "p_hard_hit_rate_14")
+    brl30 = pick("p_barrel_rate_30", "p_hard_hit_rate_30")
     qoc = np.nanmax(np.vstack([brl14.values, brl30.values]), axis=0)
     factor *= np.where(qoc>=0.11, 1.07, np.where(qoc>=0.09, 1.04, 1.0))
 
-    fb14 = pick("p_fb_rate_14","p_fb_rate_7","p_fb_rate")
-    gb14 = pick("p_gb_rate_14","p_gb_rate_7","p_gb_rate")
+    fb14 = pick("p_fb_rate_14", "p_fb_rate_7", "p_fb_rate")
+    gb14 = pick("p_gb_rate_14", "p_gb_rate_7", "p_gb_rate")
     factor *= np.where(fb14>=0.42, 1.04, np.where(fb14>=0.38, 1.02, 1.0))
     factor *= np.where((~np.isnan(gb14)) & (gb14<=0.40), 1.02, 1.0)
 
-    bb_rate = pick("p_bb_rate_14","p_bb_rate_30","p_bb_rate")
+    bb_rate = pick("p_bb_rate_14", "p_bb_rate_30", "p_bb_rate")
     factor *= np.where(bb_rate>=0.09, 1.02, 1.0)
 
-    xw = pick("p_xwoba_con_14","p_xwoba_con_30","p_xwoba_con")
+    xw = pick("p_xwoba_con_14", "p_xwoba_con_30", "p_xwoba_con")
     factor *= np.where(xw>=0.40, 1.05, np.where(xw>=0.36, 1.03, 1.0))
 
-    ev_allowed = pick("p_avg_exit_velo_14","p_avg_exit_velo_7","p_avg_exit_velo_30")
+    ev_allowed = pick("p_avg_exit_velo_14", "p_avg_exit_velo_7", "p_avg_exit_velo_30")
     factor *= np.where(ev_allowed>=90.0, 1.03, 1.0)
 
     return np.clip(factor, 0.90, 1.18).astype(np.float32)
@@ -433,13 +457,15 @@ def short_term_hot_factor_vectorized(df):
                 out = out.where(~out.isna(), v)
         return out
 
-    ev = pick("b_avg_exit_velo_5","b_avg_exit_velo_3")
-    la = pick("b_la_mean_5","b_la_mean_3")
-    br = pick("b_barrel_rate_5","b_barrel_rate_3")
+    ev = pick("b_avg_exit_velo_5", "b_avg_exit_velo_3")
+    la = pick("b_la_mean_5", "b_la_mean_3")
+    br = pick("b_barrel_rate_5", "b_barrel_rate_3")
+
     factor = np.ones(len(df), dtype=np.float64)
     factor *= np.where(ev>=91, 1.03, 1.0)
     factor *= np.where((la>=12)&(la<=24), 1.02, 1.0)
     factor *= np.where(br>=0.12, 1.05, np.where(br>=0.08, 1.02, 1.0))
+
     return np.clip(factor, 0.96, 1.10).astype(np.float32)
 
 def compute_overlay_cols_vectorized(df: pd.DataFrame) -> pd.DataFrame:
@@ -500,7 +526,8 @@ if event_file is not None and today_file is not None:
         # Basic cleaning & type fixes
         for dfname, df in [("event_df", event_df), ("today_df", today_df)]:
             if find_duplicate_columns(df):
-                st.error(f"Duplicate columns in {dfname}"); st.stop()
+                st.error(f"Duplicate columns in {dfname}")
+                st.stop()
         event_df = fix_types(dedup_columns(event_df.dropna(axis=1, how='all'))).reset_index(drop=True)
         today_df = fix_types(dedup_columns(today_df.dropna(axis=1, how='all'))).reset_index(drop=True)
 
@@ -510,7 +537,8 @@ if event_file is not None and today_file is not None:
 
     target_col = 'hr_outcome'
     if target_col not in event_df.columns:
-        st.error("ERROR: No 'hr_outcome' column in event data."); st.stop()
+        st.error("ERROR: No 'hr_outcome' column in event data.")
+        st.stop()
     st.success("✅ 'hr_outcome' found.")
 
     # ---- Leak-prone drop ----
@@ -535,19 +563,23 @@ if event_file is not None and today_file is not None:
     nan_pct = X.isna().mean()
     drop_cols = nan_pct[nan_pct > 0.30].index.tolist()
     if drop_cols:
-        X = X.drop(columns=drop_cols); X_today = X_today.drop(columns=drop_cols, errors='ignore')
+        X = X.drop(columns=drop_cols)
+        X_today = X_today.drop(columns=drop_cols, errors='ignore')
 
     nzv_cols = X.loc[:, X.nunique() <= 2].columns.tolist()
     if nzv_cols:
-        X = X.drop(columns=nzv_cols); X_today = X_today.drop(columns=nzv_cols, errors='ignore')
+        X = X.drop(columns=nzv_cols)
+        X_today = X_today.drop(columns=nzv_cols, errors='ignore')
 
     corrs = X.corr().abs()
     upper = corrs.where(np.triu(np.ones(corrs.shape), k=1).astype(bool))
     to_drop = [column for column in upper.columns if any(upper[column] > 0.999)]
     if to_drop:
-        X = X.drop(columns=to_drop); X_today = X_today.drop(columns=to_drop, errors='ignore')
+        X = X.drop(columns=to_drop)
+        X_today = X_today.drop(columns=to_drop, errors='ignore')
 
-    X = winsorize_clip(X); X_today = winsorize_clip(X_today)
+    X = winsorize_clip(X)
+    X_today = winsorize_clip(X_today)
 
     # ---- Chronological ordering ----
     y = event_df[target_col].astype(int)
@@ -584,7 +616,8 @@ if event_file is not None and today_file is not None:
     # ---------- Target Encoding ----------
     cat_cols_available = [c for c in ["park","team_code","batter_hand","pitcher_team_code"] if c in event_df.columns]
     cats_full = event_df[cat_cols_available].copy()
-    if order_idx is not None: cats_full = cats_full.loc[order_idx].reset_index(drop=True)
+    if order_idx is not None:
+        cats_full = cats_full.loc[order_idx].reset_index(drop=True)
     cats_full = cats_full.loc[X.index].reset_index(drop=True)
 
     def _combo(a, b):
@@ -593,8 +626,10 @@ if event_file is not None and today_file is not None:
         return (a + "×" + b).replace("nan", "__NA__")
 
     te_specs = []
-    if "park" in cats_full.columns: te_specs.append(("te_park", cats_full["park"]))
-    if "team_code" in cats_full.columns: te_specs.append(("te_team", cats_full["team_code"]))
+    if "park" in cats_full.columns:
+        te_specs.append(("te_park", cats_full["park"]))
+    if "team_code" in cats_full.columns:
+        te_specs.append(("te_team", cats_full["team_code"]))
     if set(["park","batter_hand"]).issubset(cats_full.columns):
         te_specs.append(("te_park_hand", _combo(cats_full["park"], cats_full["batter_hand"])))
     if set(["pitcher_team_code","batter_hand"]).issubset(cats_full.columns):
@@ -603,7 +638,8 @@ if event_file is not None and today_file is not None:
     n_splits = 2
     folds = embargo_time_splits(dates_aligned, n_splits=n_splits, embargo_days=1)
 
-    te_maps = {}; global_means = {}
+    te_maps = {}
+    global_means = {}
     for name, ser in te_specs:
         oof_vals, fmap, gmean = oof_target_encode(ser, y.values, dates_aligned, folds, smoothing=50.0)
         X[name] = oof_vals.astype(np.float32)
@@ -637,7 +673,8 @@ if event_file is not None and today_file is not None:
 
     # ---------- Build overlay features for TRAIN copy (for OOF retune diagnostics) ----------
     event_aligned = event_df.copy()
-    if order_idx is not None: event_aligned = event_aligned.loc[order_idx].reset_index(drop=True)
+    if order_idx is not None:
+        event_aligned = event_aligned.loc[order_idx].reset_index(drop=True)
     event_aligned = event_aligned.loc[X.index].reset_index(drop=True)
 
     debug_mem("Before overlay TRAIN", event_aligned)
@@ -808,7 +845,8 @@ if event_file is not None and today_file is not None:
         st.success(
             f"Fold {fold + 1}/{len(folds)} finished in {_fmt_td(fold_time)} • "
             f"ETA {_fmt_td(est_time_left)} • RAM {round(mem_mb(),1)} MB"
-    )
+        )
+
     # ---------- Day-wise LGBMRanker head ----------
     days = pd.to_datetime(dates_aligned).dt.floor("D")
     ranker_oof = np.zeros(len(y), dtype=np.float32)
@@ -822,8 +860,10 @@ if event_file is not None and today_file is not None:
         with time_block(f"Ranker Fold {fold+1} fit", holder=ranker_log):
             X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
             y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-            d_tr = days.iloc[tr_idx]; d_va = days.iloc[va_idx]
-            g_tr = _groups_from_days(d_tr); g_va = _groups_from_days(d_va)
+            d_tr = days.iloc[tr_idx]
+            d_va = days.iloc[va_idx]
+            g_tr = _groups_from_days(d_tr)
+            g_va = _groups_from_days(d_va)
 
             rk = lgb.LGBMRanker(
                 objective="lambdarank", metric="ndcg",
@@ -886,77 +926,70 @@ if event_file is not None and today_file is not None:
         logits_oof = logit(np.clip(y_oof_iso, 1e-6, 1-1e-6))
         y_oof_iso_t = expit(logits_oof * best_T)
         p_oof_cal = (1.0 - beta_prior) * y_oof_iso_t + beta_prior * prior_oof
-    # --- Guard & diagnostics right after prior-blend, before segmented models ---
+
+    # --- Ensure TODAY overlays (vectorized) + diagnostics (single place) ---
     with time_block("Ensure TODAY overlays (vectorized) + diagnostics"):
         try:
-            # 1) Ensure vectorized TODAY overlays are present before they are used anywhere
+            # If overlay columns not present (or duplicated), rebuild vectorized overlays
             need_overlay = ("final_multiplier" not in today_df.columns) or \
                            ("overlay_multiplier" not in today_df.columns) or \
                            ("final_multiplier_raw" not in today_df.columns)
+
+            # Collapse duplicate columns FIRST (avoids DataFrame-in-cell issues)
+            dup_cols = today_df.columns[today_df.columns.duplicated()].tolist()
+            if dup_cols:
+                st.warning({"duplicate_columns_in_today_df": dup_cols})
+                for name in pd.unique(dup_cols):
+                    sub = today_df.loc[:, today_df.columns == name]
+                    # Prefer numeric consolidation; fallback to string consolidation
+                    try:
+                        sub_num = sub.apply(pd.to_numeric, errors="coerce")
+                        single = sub_num.ffill(axis=1).iloc[:, -1]
+                    except Exception:
+                        sub_str = sub.astype(str)
+                        single = sub_str.ffill(axis=1).iloc[:, -1]
+                    # Drop all but the first, then overwrite
+                    cols_to_drop = list(sub.columns[1:])
+                    if cols_to_drop:
+                        today_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+                    today_df[name] = single
+
             if need_overlay:
                 st.write({"overlay_today": "building_vectorized"})
                 today_df = compute_overlay_cols_vectorized(today_df)
                 today_df = today_df.copy()  # de-fragment
 
-            # 2) Sanity on shapes / NaNs
+            # Sanity on shapes / NaNs
             st.write({
                 "post_overlay_today_shape": today_df.shape,
                 "X_today_shape_check": X_today.shape,
                 "has_final_multiplier": "final_multiplier" in today_df.columns,
-                "has_overlay_multiplier": "overlay_multiplier" in today_df.columns
+                "has_overlay_multiplier": "overlay_multiplier" in today_df.columns,
+                "dup_cols_after_overlay": int(today_df.columns.duplicated().sum())
             })
 
             if len(today_df) != len(X_today):
                 st.error(f"Row mismatch: today_df({len(today_df)}) vs X_today({len(X_today)})")
                 st.stop()
 
-            # Warn if there are duplicate column names (this can make df['col'] a DataFrame)
-            dup_cols = today_df.columns[today_df.columns.duplicated()].tolist()
-            if dup_cols:
-                st.warning({"duplicate_columns_in_today_df": dup_cols})
-            # If there are duplicate columns, collapse each duplicated name into a single numeric Series.
-            if dup_cols:
-                # Work on unique duplicated names only
-                for name in pd.unique(dup_cols):
-                    sub = today_df.loc[:, today_df.columns == name]
-                    # Coerce all dups to numeric (errors -> NaN)
-                    sub_num = sub.apply(pd.to_numeric, errors="coerce")
-                    # Prefer the right-most (newest) non-null value per row
-                    single = sub_num.ffill(axis=1).iloc[:, -1]
-                    # Drop all duplicate columns except the first occurrence
-                    cols_to_drop = list(sub.columns[1:])  # keep the first, drop the rest
-                    if cols_to_drop:
-                        today_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
-                    # Overwrite the kept column with the consolidated numeric values
-                    today_df[name] = single.astype(np.float32)
-
-            # Now it’s safe to run the NaN check on single columns
+            # NaN checks (robust to accidental non-1D)
             for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
                 if c in today_df.columns:
                     val = today_df[c]
                     if isinstance(val, pd.DataFrame):
-                        # Safety: in case something else reintroduced duplicates
                         val = val.ffill(axis=1).iloc[:, -1]
                     elif not isinstance(val, (pd.Series, np.ndarray, list, tuple)):
                         val = pd.Series(val, index=today_df.index)
                     n_nan = pd.to_numeric(val, errors="coerce").isna().sum()
                     if n_nan:
                         st.warning({f"NaNs in {c}": int(n_nan)})
-            for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
-                if c in today_df.columns:
-                    val = today_df[c]
-                    # If duplicate col names produced a DataFrame, take the first real column
-                    if isinstance(val, pd.DataFrame):
-                        val = val.iloc[:, 0]
-                    elif not isinstance(val, (pd.Series, np.ndarray, list, tuple)):
-                        val = pd.Series(val, index=today_df.index)
-                    n_nan = pd.to_numeric(val, errors="coerce").isna().sum()
-                    if n_nan:
-                        st.warning({f"NaNs in {c}": int(n_nan)})
+
+            # Coerce to numeric float32
             for c in ["overlay_multiplier", "final_multiplier_raw", "final_multiplier"]:
                 if c in today_df.columns:
                     today_df[c] = pd.to_numeric(today_df[c], errors="coerce").astype(np.float32)
 
+            # quick stats
             try:
                 fm = today_df["final_multiplier"].to_numpy(dtype=float)
                 st.write({
@@ -974,6 +1007,7 @@ if event_file is not None and today_file is not None:
         except Exception as e:
             st.exception(e)
             st.stop()
+
     # ---------- Handedness-segmented small models (blend into base preds) ----------
     with time_block("Segmented models (L/R)"):
         def segment_indices(df_ref):
@@ -1008,7 +1042,8 @@ if event_file is not None and today_file is not None:
             idx = np.where(mask_tr)[0]
             if len(idx) < 200:
                 return None, None, None  # too small, skip
-            X_loc = X.iloc[idx]; y_loc = y.iloc[idx]
+            X_loc = X.iloc[idx]
+            y_loc = y.iloc[idx]
             P_oof = np.zeros(len(y_loc), dtype=np.float32)
             P_td_parts = []
             for (tr_idx, va_idx) in folds:
@@ -1053,99 +1088,14 @@ if event_file is not None and today_file is not None:
         p_base = (1.0 - beta_prior) * expit(logits_today_seg * best_T) + beta_prior * prior_today
         st.write({"p_base_shape": p_base.shape})
 
-    # ---------- Build TODAY overlay columns ----------
-            # Ensure today's inputs are deduplicated, typed, and 1-D before vectorized helpers
-            def _dedup_inplace(df):
-                dup = df.columns[df.columns.duplicated()].tolist()
-                if dup:
-                    st.warning({"duplicate_columns_in_today_df": dup})
-                    for name in pd.unique(dup):
-                        sub = df.loc[:, df.columns == name]
-                        # consolidate duplicates to a single numeric/str series by preferring right-most non-null
-                        if sub.shape[1] > 1:
-                            # try numeric first; if not numeric, do string consolidation
-                            try:
-                                sub_num = sub.apply(pd.to_numeric, errors="coerce")
-                                single = sub_num.ffill(axis=1).iloc[:, -1]
-                            except Exception:
-                                sub_str = sub.astype(str)
-                                single = sub_str.ffill(axis=1).iloc[:, -1]
-                            df.drop(columns=list(sub.columns[1:]), inplace=True, errors="ignore")
-                            df[name] = single
-
-            def _coerce_numeric_inplace(df, cols):
-                for c in cols:
-                    if c in df.columns:
-                        # if a DataFrame snuck in from dup names, flatten it
-                        if isinstance(df[c], pd.DataFrame):
-                            df[c] = df[c].ffill(axis=1).iloc[:, -1]
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            def ensure_today_vectorized_inputs(df):
-                df = df.copy()
-
-                # 1) collapse duplicate columns first
-                _dedup_inplace(df)
-
-                # 2) coerce expected string cols to str (handles DataFrame dup case too)
-                str_cols = [
-                    "roof_status", "wind_dir_string", "batter_hand", "stand",
-                    "pitcher_hand", "p_throws", "condition", "park"
-                ]
-                for c in str_cols:
-                    if c in df.columns:
-                        if isinstance(df[c], pd.DataFrame):
-                            df[c] = df[c].astype(str).ffill(axis=1).iloc[:, -1]
-                        df[c] = df[c].astype(str)
-
-                # 3) coerce all overlay-used numeric columns to numeric
-                num_cols = [
-                    "temp","humidity","wind_mph","park_altitude","park_hr_rate",
-                    "park_hr_pct_rhb","park_hr_pct_lhb",
-                    "b_pull_rate_7","b_pull_rate_14","b_fb_rate_7","b_fb_rate_14",
-                    "b_barrel_rate_7","b_barrel_rate_14","b_hr_per_pa_7","b_hr_per_pa_5",
-                    "p_fb_rate_14","p_fb_rate_7",
-                    "p_rolling_hr_3","p_hr_count_3","p_rolling_pa_3",
-                    "p_fs_barrel_rate_14","p_barrel_rate_14","p_hard_hit_rate_14",
-                    "p_fs_barrel_rate_30","p_barrel_rate_30","p_hard_hit_rate_30",
-                    "p_gb_rate_14","p_gb_rate_7","p_gb_rate","p_gb_pct",
-                    "p_fb_rate","p_fb_pct",
-                    "p_bb_rate_14","p_bb_rate_30","p_bb_rate",
-                    "p_xwoba_con_14","p_xwoba_con_30","p_xwoba_con",
-                    "p_avg_exit_velo_14","p_avg_exit_velo_7","p_avg_exit_velo_30",
-                    "p_exit_velocity_avg","p_avg_exit_velo",
-                    "b_avg_exit_velo_5","b_avg_exit_velo_3",
-                    "b_la_mean_5","b_la_mean_3",
-                    "b_barrel_rate_5","b_barrel_rate_3",
-                ]
-                _coerce_numeric_inplace(df, [c for c in num_cols if c in df.columns])
-
-                return df
-
-            # run the guard once before vectorized overlay
-            today_df = ensure_today_vectorized_inputs(today_df)
-
-            # (keep your existing line)
-            today_df = compute_overlay_cols_vectorized(today_df)
-
-            # quick sanity after overlay
-            st.write({
-                "post_overlay_today_shape": today_df.shape,
-                "dup_cols_after_overlay": int(today_df.columns.duplicated().sum())
-            })
-    with time_block("Compute TODAY overlays (vectorized)"):
-        try:
-            today_df = compute_overlay_cols_vectorized(today_df)
-            st.info({
-                "today_overlay_cols": [c for c in ["overlay_multiplier", "final_multiplier", "final_multiplier_raw",
-                                                   "weak_pitcher_factor", "hot_streak_factor",
-                                                   "temp_rating","humidity_rating","wind_rating","condition_rating"]
-                                       if c in today_df.columns][:10]
-            })
-        except Exception as e:
-            st.exception(e)
-            st.error("Overlay computation failed; cannot continue.")
-            st.stop()
+    # ---------- (Optional) quick overlay column list (no recompute) ----------
+    with time_block("Overlay columns present (no recompute)"):
+        st.info({
+            "today_overlay_cols": [c for c in ["overlay_multiplier", "final_multiplier", "final_multiplier_raw",
+                                               "weak_pitcher_factor", "hot_streak_factor",
+                                               "temp_rating","humidity_rating","wind_rating","condition_rating"]
+                                   if c in today_df.columns][:10]
+        })
 
     # ---------- OOF helpers for micro weight retune ----------
     with time_block("RRF + disagreement (OOF & TODAY)"):
@@ -1169,7 +1119,8 @@ if event_file is not None and today_file is not None:
         r_prob = _rank_desc(p_base)
         r_ranker = _rank_desc(ranker_today)
         if "final_multiplier" not in today_df.columns:
-            st.error("final_multiplier missing on TODAY after overlay step"); st.stop()
+            st.error("final_multiplier missing on TODAY after overlay step")
+            st.stop()
         r_overlay = _rank_desc(today_df["final_multiplier"].values)
         rrf = 1.0/(k_rrf + r_prob) + 1.0/(k_rrf + r_ranker) + 1.0/(k_rrf + r_overlay)
 
@@ -1196,7 +1147,8 @@ if event_file is not None and today_file is not None:
 
         def zsafe(s):
             s = pd.to_numeric(s, errors="coerce").astype(float)
-            mu = np.nanmean(s.values); sd = np.nanstd(s.values) + 1e-9
+            mu = np.nanmean(s.values)
+            sd = np.nanstd(s.values) + 1e-9
             return pd.Series((s.values - mu) / sd, index=s.index)
 
         logit_p = logit(np.clip(p_base, 1e-6, 1 - 1e-6))
@@ -1233,6 +1185,9 @@ if event_file is not None and today_file is not None:
         grid = [0.85, 1.0, 1.15]
         best_loss, best_W = 1e9, base_W.copy()
         logit_p_oof = logit(np.clip(p_oof_cal, 1e-6, 1-1e-6))
+        def _rank_desc_local(x):  # avoid closure confusion
+            x = np.asarray(x)
+            return pd.Series(-x).rank(method="min").astype(int).values
         for m_prob in grid:
             for m_rank in grid:
                 W = base_W.copy()
@@ -1245,7 +1200,13 @@ if event_file is not None and today_file is not None:
                              else np.ones_like(logit_p_oof)) + 1e-9
                           )
                         + W["w_ranker"] * zscore(ranker_oof)
-                        + W["w_rrf"] * zscore(1.0/(60.0 + _rank_desc(p_oof_cal)) + 1.0/(60.0 + _rank_desc(ranker_oof)) + 1.0/(60.0 + _rank_desc(event_aligned.get("final_multiplier", pd.Series(np.ones_like(p_oof_cal))).values)))
+                        + W["w_rrf"] * zscore(
+                            1.0/(60.0 + _rank_desc_local(p_oof_cal))
+                            + 1.0/(60.0 + _rank_desc_local(ranker_oof))
+                            + 1.0/(60.0 + _rank_desc_local(
+                                event_aligned.get("final_multiplier", pd.Series(np.ones_like(p_oof_cal))).values
+                            ))
+                        )
                         - W["w_penalty"] * dis_penalty_oof)
                 p_hat = expit(comb)
                 loss = log_loss(y, np.clip(p_hat, 1e-6, 1-1e-6))
@@ -1330,123 +1291,123 @@ if event_file is not None and today_file is not None:
         st.write({"ranked_score_shape": ranked_score.shape})
 
     # ================= Leaderboard Build & Outputs (with tie-breaking) =================
-        with time_block("Build leaderboard & outputs"):
-            def build_leaderboard(df, calibrated_probs, final_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"):
-                df = df.copy()
+    with time_block("Build leaderboard & outputs"):
+        def build_leaderboard(df, calibrated_probs, final_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"):
+            df = df.copy()
 
-                # core scores
-                df[label] = np.asarray(calibrated_probs)
-                df["ranked_probability"] = np.asarray(final_score)
-                df["prob_2tb"] = np.asarray(prob_2tb)
-                df["prob_rbi"] = np.asarray(prob_rbi)
+            # core scores
+            df[label] = np.asarray(calibrated_probs)
+            df["ranked_probability"] = np.asarray(final_score)
+            df["prob_2tb"] = np.asarray(prob_2tb)
+            df["prob_rbi"] = np.asarray(prob_rbi)
 
-                # tie-breaking: ranked_probability ↓, then prob_2tb ↓, then prob_rbi ↓
-                df = df.sort_values(by=["ranked_probability", "prob_2tb", "prob_rbi"], ascending=[False, False, False]).reset_index(drop=True)
-                df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
+            # tie-breaking: ranked_probability ↓, then prob_2tb ↓, then prob_rbi ↓
+            df = df.sort_values(by=["ranked_probability", "prob_2tb", "prob_rbi"], ascending=[False, False, False]).reset_index(drop=True)
+            df["hr_base_rank"] = df[label].rank(method="min", ascending=False)
 
-                # identifiers if present
-                mlb_id_col = None
-                for c in ["batter_id", "mlb_id"]:
-                    if c in df.columns:
-                        mlb_id_col = c
-                        break
+            # identifiers if present
+            mlb_id_col = None
+            for c in ["batter_id", "mlb_id"]:
+                if c in df.columns:
+                    mlb_id_col = c
+                    break
 
-                cols = []
-                if mlb_id_col:
-                    cols.append(mlb_id_col)
-                for c in ["player_name", "team_code", "time"]:
-                    if c in df.columns:
-                        cols.append(c)
+            cols = []
+            if mlb_id_col:
+                cols.append(mlb_id_col)
+            for c in ["player_name", "team_code", "time"]:
+                if c in df.columns:
+                    cols.append(c)
 
-                cols += [
-                    label, "ranked_probability",
-                    "prob_2tb", "prob_rbi",
-                    "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-                    "final_multiplier_raw", "final_multiplier",
-                    "temp", "temp_rating", "humidity", "humidity_rating",
-                    "wind_mph", "wind_rating", "wind_dir_string",
-                    "condition", "condition_rating",
-                    # diagnostics (if present)
-                    "rrf_aux", "model_disagreement",
-                    "hr_outcome",
-                ]
-                cols = [c for c in cols if c in df.columns]
-                out = df[cols].copy()
+            cols += [
+                label, "ranked_probability",
+                "prob_2tb", "prob_rbi",
+                "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+                "final_multiplier_raw", "final_multiplier",
+                "temp", "temp_rating", "humidity", "humidity_rating",
+                "wind_mph", "wind_rating", "wind_dir_string",
+                "condition", "condition_rating",
+                # diagnostics (if present)
+                "rrf_aux", "model_disagreement",
+                "hr_outcome",
+            ]
+            cols = [c for c in cols if c in df.columns]
+            out = df[cols].copy()
 
-                # robust rounding helpers (avoid TypeError on non-1D)
-                def _safe_round_numeric(series_like, ndigits):
-                    try:
-                        return pd.to_numeric(series_like, errors="coerce").astype(float).round(ndigits)
-                    except Exception:
-                        return series_like  # leave as-is if it can't be coerced safely
+            # robust rounding helpers (avoid TypeError on non-1D)
+            def _safe_round_numeric(series_like, ndigits):
+                try:
+                    return pd.to_numeric(series_like, errors="coerce").astype(float).round(ndigits)
+                except Exception:
+                    return series_like  # leave as-is if it can't be coerced safely
 
-                for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
-                    if c in out.columns:
-                        out[c] = _safe_round_numeric(out[c], 4)
+            for c in [label, "ranked_probability", "prob_2tb", "prob_rbi"]:
+                if c in out.columns:
+                    out[c] = _safe_round_numeric(out[c], 4)
 
-                for c in [
-                    "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
-                    "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
-                ]:
-                    if c in out.columns:
-                        out[c] = _safe_round_numeric(out[c], 3)
+            for c in [
+                "overlay_multiplier", "weak_pitcher_factor", "hot_streak_factor",
+                "final_multiplier_raw", "final_multiplier", "rrf_aux", "model_disagreement"
+            ]:
+                if c in out.columns:
+                    out[c] = _safe_round_numeric(out[c], 3)
 
-                return out
+            return out
 
-            # Attach diagnostics used in CSV/UI
-            today_df_local = today_df.copy()
-            today_df_local["rrf_aux"] = rrf
-            today_df_local["model_disagreement"] = disagree_std
+        # Attach diagnostics used in CSV/UI
+        today_df_local = today_df.copy()
+        today_df_local["rrf_aux"] = rrf
+        today_df_local["model_disagreement"] = disagree_std
 
-            leaderboard = build_leaderboard(
-                today_df_local, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"
-            )
+        leaderboard = build_leaderboard(
+            today_df_local, p_base, ranked_score, prob_2tb, prob_rbi, label="hr_probability_iso_T"
+        )
 
-            # ===== Render current-day leaderboard (no charts) =====
-            top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
-            st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
-            leaderboard_top = leaderboard.head(int(top_n))
-            st.dataframe(leaderboard_top, use_container_width=True)
+        # ===== Render current-day leaderboard (no charts) =====
+        top_n = st.sidebar.number_input("Top-N to display", min_value=10, max_value=100, value=30, step=5)
+        st.markdown(f"### 🏆 **Top {int(top_n)} HR Leaderboard (Blended + Overlays + Ranker)**")
+        leaderboard_top = leaderboard.head(int(top_n))
+        st.dataframe(leaderboard_top, use_container_width=True)
 
-            st.download_button(
-                label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
-                data=leaderboard_top.to_csv(index=False),
-                file_name=f"top{int(top_n)}_leaderboard_blended.csv",
-                mime="text/csv",
-            )
-            st.download_button(
-                label="⬇️ Download Full Prediction CSV (Blended)",
-                data=leaderboard.to_csv(index=False),
-                file_name="today_hr_predictions_full_blended.csv",
-                mime="text/csv",
-            )
+        st.download_button(
+            label=f"⬇️ Download Top {int(top_n)} Leaderboard CSV",
+            data=leaderboard_top.to_csv(index=False),
+            file_name=f"top{int(top_n)}_leaderboard_blended.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            label="⬇️ Download Full Prediction CSV (Blended)",
+            data=leaderboard.to_csv(index=False),
+            file_name="today_hr_predictions_full_blended.csv",
+            mime="text/csv",
+        )
 
-            # Drift diagnostics (safe, no plots)
-            try:
-                def drift_check(train_df, today_df_in, n=6):
-                    drifted = []
-                    # only compare overlapping numeric columns
-                    common = list(set(train_df.columns) & set(today_df_in.columns))
-                    for c in common:
-                        if not (np.issubdtype(train_df[c].dtype, np.number) and np.issubdtype(today_df_in[c].dtype, np.number)):
-                            continue
-                        tmean = np.nanmean(train_df[c].to_numpy(dtype=float))
-                        tstd  = np.nanstd(train_df[c].to_numpy(dtype=float))
-                        dmean = np.nanmean(today_df_in[c].to_numpy(dtype=float))
-                        if tstd > 0 and np.isfinite(tstd) and abs(tmean - dmean) / tstd > n:
-                            drifted.append(c)
-                    return drifted
+        # Drift diagnostics (safe, no plots)
+        try:
+            def drift_check(train_df, today_df_in, n=6):
+                drifted = []
+                # only compare overlapping numeric columns
+                common = list(set(train_df.columns) & set(today_df_in.columns))
+                for c in common:
+                    if not (np.issubdtype(train_df[c].dtype, np.number) and np.issubdtype(today_df_in[c].dtype, np.number)):
+                        continue
+                    tmean = np.nanmean(train_df[c].to_numpy(dtype=float))
+                    tstd  = np.nanstd(train_df[c].to_numpy(dtype=float))
+                    dmean = np.nanmean(today_df_in[c].to_numpy(dtype=float))
+                    if tstd > 0 and np.isfinite(tstd) and abs(tmean - dmean) / tstd > n:
+                        drifted.append(c)
+                return drifted
 
-                drifted = drift_check(X, X_today, n=6)
-                if drifted:
-                    st.markdown("#### ⚡ **Feature Drift Diagnostics**")
-                    st.write("These features show unusual mean/std changes:", drifted)
-            except Exception:
-                pass
+            drifted = drift_check(X, X_today, n=6)
+            if drifted:
+                st.markdown("#### ⚡ **Feature Drift Diagnostics**")
+                st.write("These features show unusual mean/std changes:", drifted)
+        except Exception:
+            pass
 
-            gc.collect()
-            st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
-            st.caption(
-                "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
-                "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
-            )
+        gc.collect()
+        st.success("✅ HR Prediction pipeline complete. Leaderboard generated and ready.")
+        st.caption(
+            "Meta-ensemble + calibrated probs (Adaptive-K) + segmented models + prior blend + RRF + disagreement control "
+            "+ learner (fail-closed). 2+TB and RBI proxies included with tie-breaking."
+    )
