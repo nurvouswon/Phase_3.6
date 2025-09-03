@@ -910,14 +910,22 @@ if event_file is not None and today_file is not None:
                 st.error(f"Row mismatch: today_df({len(today_df)}) vs X_today({len(X_today)})")
                 st.stop()
 
+            # Warn if there are duplicate column names (this can make df['col'] a DataFrame)
+            dup_cols = today_df.columns[today_df.columns.duplicated()].tolist()
+            if dup_cols:
+                st.warning({"duplicate_columns_in_today_df": dup_cols})
+
             for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
-    if c in today_df.columns:
-        val = today_df[c]
-        if not isinstance(val, (pd.Series, np.ndarray, list, tuple)):
-            val = pd.Series(val, index=today_df.index)
-        n_nan = pd.to_numeric(val, errors="coerce").isna().sum()
-        if n_nan:
-            st.warning({f"NaNs in {c}": int(n_nan)})
+                if c in today_df.columns:
+                    val = today_df[c]
+                    # If duplicate col names produced a DataFrame, take the first real column
+                    if isinstance(val, pd.DataFrame):
+                        val = val.iloc[:, 0]
+                    elif not isinstance(val, (pd.Series, np.ndarray, list, tuple)):
+                        val = pd.Series(val, index=today_df.index)
+                    n_nan = pd.to_numeric(val, errors="coerce").isna().sum()
+                    if n_nan:
+                        st.warning({f"NaNs in {c}": int(n_nan)})
             for c in ["overlay_multiplier", "final_multiplier_raw", "final_multiplier"]:
                 if c in today_df.columns:
                     today_df[c] = pd.to_numeric(today_df[c], errors="coerce").astype(np.float32)
