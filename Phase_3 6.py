@@ -967,7 +967,43 @@ if event_file is not None and today_file is not None:
                 "has_overlay_multiplier": "overlay_multiplier" in today_df.columns,
                 "dup_cols_after_overlay": int(today_df.columns.duplicated().sum())
             })
+            # --- Collapse duplicate columns produced by concat, then force 1-D for numeric fields ---
+            dup_cols = today_df.columns[today_df.columns.duplicated()].tolist()
+            if dup_cols:
+                st.warning({"collapsing_duplicate_cols": dup_cols})
+                # For each duplicated name, keep a single right-most non-null numeric view
+                for name in pd.unique(dup_cols):
+                    sub = today_df.loc[:, today_df.columns == name]
+                    if isinstance(sub, pd.DataFrame):
+                        if sub.shape[1] > 1:
+                            # try numeric forward-fill across dup columns
+                            try:
+                                sub_num = sub.apply(pd.to_numeric, errors="coerce")
+                            except Exception:
+                                # if some dups are strings, coerce those too; numeric coercion will make them NaN
+                                sub_num = sub.astype(str).apply(pd.to_numeric, errors="coerce")
+                            single = sub_num.ffill(axis=1).iloc[:, -1]
+                            # drop all with that name, then re-add a single Series
+                            today_df.drop(columns=sub.columns.tolist(), inplace=True, errors="ignore")
+                            today_df[name] = single
+                        else:
+                            # single column DataFrame -> Series
+                            today_df[name] = sub.iloc[:, 0]
 
+            # Ensure overlay fields are 1-D numeric Series (never DataFrame/ndarray)
+            for c in ["final_multiplier", "overlay_multiplier", "final_multiplier_raw"]:
+                if c in today_df.columns:
+                    col = today_df[c]
+                    if isinstance(col, pd.DataFrame):
+                        col = col.ffill(axis=1).iloc[:, -1]
+                    elif not isinstance(col, (pd.Series, np.ndarray, list, tuple)):
+                        col = pd.Series(col, index=today_df.index)
+                    today_df[c] = pd.to_numeric(col, errors="coerce").astype(np.float32)
+
+            # Optional: re-report dups (should be 0 now)
+            st.write({
+                "dup_cols_after_collapse": int(today_df.columns.duplicated().sum())
+            })
             if len(today_df) != len(X_today):
                 st.error(f"Row mismatch: today_df({len(today_df)}) vs X_today({len(X_today)})")
                 st.stop()
